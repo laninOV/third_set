@@ -1,0 +1,7 @@
+playwright>=1.45.0
+beautifulsoup4>=4.12.2
+lxml>=4.9.3
+httpx>=0.24.0
+numpy>=1.26.0
+pandas>=2.1.0
+python-dotenv>=1.0.0
