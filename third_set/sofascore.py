@@ -54,7 +54,21 @@ async def get_live_match_links(page: Page, *, limit: Optional[int] = None) -> Li
     Each URL includes a synthetic fragment `#id:<eventId>` so callers can recover the event id.
     """
     await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25000)
-    data = await fetch_json_via_page(page, SOFASCORE_TENNIS_LIVE_API)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    await asyncio.sleep(3)
+    try:
+        data = await fetch_json_via_page(page, SOFASCORE_TENNIS_LIVE_API)
+    except SofascoreError as exc:
+        msg = str(exc)
+        if "403" in msg and "challenge" in msg.lower():
+            _dbg("Live API blocked by challenge; waiting 10s before retry")
+            await asyncio.sleep(10)
+            data = await fetch_json_via_page(page, SOFASCORE_TENNIS_LIVE_API)
+        else:
+            raise
     out: List[str] = []
     seen: set = set()
     for ev in data.get("events", []) or []:

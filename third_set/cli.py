@@ -17,6 +17,7 @@ from third_set.analyzer import analyze_once, bet_decision
 from third_set.sofascore import (
     SOFASCORE_TENNIS_URL,
     LiveEvent,
+    SofascoreError,
     discover_match_links,
     get_live_match_links,
     get_event,
@@ -2023,7 +2024,11 @@ async def cmd_watch(
             hb_set_1_1 = 0
             hb_triggerable = 0
             hb_errors = 0
-            match_links = await get_live_match_links(page)
+            try:
+                match_links = await get_live_match_links(page)
+            except SofascoreError as exc:
+                print(f"ERROR: can't fetch live matches: {exc}")
+                continue
             hb_links = len(match_links)
             for link in match_links:
                 if stop_event.is_set():
