@@ -440,6 +440,13 @@ async def _collect_json_via_navigation(
             req = await page.context.request.get(resp.url, timeout=15000)
             text = await req.text()
             if req.status != 200:
+                # On some servers Cloudflare allows the in-browser request but blocks the
+                # standalone request context with 403. As a last resort, re-fetch inside the page.
+                if req.status == 403:
+                    try:
+                        return await fetch_json_via_page(page, resp.url)
+                    except Exception:
+                        pass
                 raise SofascoreError(f"HTTP {req.status} for {resp.url}: {text[:200]}")
             try:
                 return json.loads(text)

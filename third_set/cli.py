@@ -2821,7 +2821,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                     continue
                 try:
                     async with nav_lock:
-                        payload = await get_event_from_match_url_via_navigation(page, match_url=url, event_id=int(eid))
+                        # Avoid heavy match-page navigation just to fetch event JSON (can timeout).
+                        # /event/<id> loads faster and still triggers /api/v1/event/<id>.
+                        payload = await get_event_via_navigation(page, int(eid), timeout_ms=25_000)
                 except Exception as ex:
                     skipped += 1
                     skip_reasons["event_fetch_failed"] = skip_reasons.get("event_fetch_failed", 0) + 1
@@ -2886,7 +2888,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             try:
                 print(f"[TG] analyze_ids: {done+1}/{total} start id={eid}", flush=True)
                 async with nav_lock:
-                    payload = await get_event_from_match_url_via_navigation(page, match_url=str(url), event_id=int(eid))
+                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=25_000)
                 ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
                 if not isinstance(ev, dict) or not ev.get("id"):
                     await send(f"id={eid}: не удалось получить event.")
