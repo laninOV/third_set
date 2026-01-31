@@ -427,27 +427,52 @@ async def _collect_json_via_navigation(
     futures: Dict[str, asyncio.Future] = {k: loop.create_future() for k in predicates.keys()}
     required = required_keys if required_keys is not None else set(predicates.keys())
 
-    async def _handle_response(resp: Response) -> None:
-        for key, pred in predicates.items():
-            fut = futures[key]
-            if fut.done():
-                continue
+    async def _resp_json_fallback(resp: Response) -> Dict[str, Any]:
+        """
+        Safely parse response JSON without touching the page execution context.
+        This avoids 'Execution context was destroyed' during navigations.
+        """
+        try:
+            return await resp.json()
+        except Exception:
+            # Some responses can be "unavailable" via resp.json() (cache edge cases).
+            # Use the context request API (same cookies/profile) as a fallback.
+            req = await page.context.request.get(resp.url, timeout=15000)
+            text = await req.text()
+            if req.status != 200:
+                raise SofascoreError(f"HTTP {req.status} for {resp.url}: {text[:200]}")
             try:
-                if not pred(resp):
-                    continue
-                if resp.status != 200:
-                    fut.set_exception(SofascoreError(f"HTTP {resp.status} for {resp.url}"))
-                    continue
-                # Getting the body from a Playwright Response can fail for cached
-                # resources (“No resource with given identifier found”). To keep
-                # this robust, re-fetch the JSON inside the same page context.
-                fut.set_result(await fetch_json_via_page(page, resp.url))
+                return json.loads(text)
             except Exception as e:
-                if not fut.done():
-                    fut.set_exception(e)
+                raise SofascoreError(f"Invalid JSON for {resp.url}: {text[:200]}") from e
+
+    async def _handle_response(resp: Response) -> None:
+        try:
+            for key, pred in predicates.items():
+                fut = futures[key]
+                if fut.done():
+                    continue
+                try:
+                    if not pred(resp):
+                        continue
+                    if resp.status != 200:
+                        if not fut.done():
+                            fut.set_exception(SofascoreError(f"HTTP {resp.status} for {resp.url}"))
+                        continue
+                    data = await _resp_json_fallback(resp)
+                    if not fut.done():
+                        fut.set_result(data)
+                except Exception as e:
+                    if not fut.done():
+                        fut.set_exception(e)
+        except Exception:
+            # Never let response-handler tasks raise.
+            return
 
     def _on_response(resp: Response) -> None:
-        asyncio.create_task(_handle_response(resp))
+        t = asyncio.create_task(_handle_response(resp))
+        # Retrieve exception to avoid "Future exception was never retrieved".
+        t.add_done_callback(lambda tt: tt.exception() if not tt.cancelled() else None)
 
     page.on("response", _on_response)
     try:
