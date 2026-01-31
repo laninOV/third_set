@@ -1264,6 +1264,19 @@ async def _history_rows_for_player_audit(
                         extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
                         timeout=retry_t,
                     )
+                except Exception as ex:
+                    # Sofascore can trigger a locale redirect / internal navigation right after goto(),
+                    # which occasionally destroys the JS execution context during DOM parsing.
+                    # Retry once; this improves history coverage on large tournaments.
+                    msg = str(ex)
+                    if "Execution context was destroyed" in msg or "most likely because of a navigation" in msg:
+                        await asyncio.sleep(0.35)
+                        stats = await asyncio.wait_for(
+                            extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
+                            timeout=min(45.0, max(per_event_timeout_s * 1.5, per_event_timeout_s + 5.0)),
+                        )
+                    else:
+                        raise
                 dom_used = True
                 dom_err = None
             except Exception as ex:

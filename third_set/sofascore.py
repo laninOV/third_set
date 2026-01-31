@@ -985,11 +985,26 @@ async def get_event_from_match_url_via_navigation(
 
 async def get_event_from_match_url_auto(page: Page, match_url: str, *, timeout_ms: int = 15000) -> Dict[str, Any]:
     """
-    Navigate to a match URL and capture the first /api/v1/event/<id> response.
+    Navigate to a match URL and capture the correct /api/v1/event/<id> response.
     Use when event_id is unknown (DOM-only discovery).
+
+    Important: a match page can trigger multiple /api/v1/event/* requests (side widgets, related events).
+    We validate the captured payload against the match URL path (slug/customId) before accepting it.
     """
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
+
+    def _parse_match_path(url: str) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            base = (url or "").split("#", 1)[0]
+            m = re.search(r"/tennis/match/([^/]+)/([^/?#]+)", base)
+            if not m:
+                return None, None
+            return m.group(1), m.group(2)
+        except Exception:
+            return None, None
+
+    want_slug, want_custom = _parse_match_path(str(match_url))
 
     async def _on_response(resp: Response) -> None:
         if fut.done():
@@ -1000,9 +1015,28 @@ async def get_event_from_match_url_auto(page: Page, match_url: str, *, timeout_m
                 return
             if resp.status != 200:
                 return
-            # Response.json() can fail for cached resources (“No data found for resource…”).
-            # Re-fetch inside the same page context to keep this robust.
-            data = await fetch_json_via_page(page, url)
+
+            # Safely decode JSON without touching the page JS context (can be destroyed by navigation).
+            try:
+                data = await resp.json()
+            except Exception:
+                req = await page.context.request.get(url, timeout=15000)
+                txt = await req.text()
+                if req.status != 200:
+                    return
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    return
+
+            ev = data.get("event") if isinstance(data, dict) else None
+            if not isinstance(ev, dict):
+                return
+            if want_slug and str(ev.get("slug") or "") != str(want_slug):
+                return
+            if want_custom and str(ev.get("customId") or "") != str(want_custom):
+                return
+
             if not fut.done():
                 fut.set_result(data)
         except Exception as exc:

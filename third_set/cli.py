@@ -2806,6 +2806,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         count = 0
         total = len(cards)
         skipped = 0
+        skip_reasons: dict[str, int] = {}
         started = time.time()
         print(f"[TG] analyze_all: найдено live={total}", flush=True)
         for idx, c in enumerate(cards, 1):
@@ -2816,16 +2817,26 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 url = c.get("url")
                 if not isinstance(eid, int) or not isinstance(url, str) or not url:
                     skipped += 1
+                    skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
                     continue
-                async with nav_lock:
-                    payload = await get_event_from_match_url_via_navigation(page, match_url=url, event_id=int(eid))
+                try:
+                    async with nav_lock:
+                        payload = await get_event_from_match_url_via_navigation(page, match_url=url, event_id=int(eid))
+                except Exception as ex:
+                    skipped += 1
+                    skip_reasons["event_fetch_failed"] = skip_reasons.get("event_fetch_failed", 0) + 1
+                    if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                        print(f"[TG] analyze_all: id={eid} event_fetch_failed: {type(ex).__name__}: {ex}", flush=True)
+                    continue
                 ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
                 if not is_singles_event(ev):
                     skipped += 1
+                    skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
                     continue
                 dpc = ev.get("defaultPeriodCount")
                 if isinstance(dpc, int) and dpc != 3:
                     skipped += 1
+                    skip_reasons["not_bo3"] = skip_reasons.get("not_bo3", 0) + 1
                     continue
                 home = ((ev.get("homeTeam") or {}).get("name")) or "—"
                 away = ((ev.get("awayTeam") or {}).get("name")) or "—"
@@ -2839,12 +2850,20 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 raise
             except Exception:
                 skipped += 1
+                skip_reasons["exception"] = skip_reasons.get("exception", 0) + 1
                 continue
         if count == 0:
             await send("Live матчей для анализа не найдено.")
         else:
             dt = int(time.time() - started)
-            await send(f"Готово. Проанализировано матчей: {count} (пропущено {skipped}), время {dt}s")
+            # Compact, but actionable: show why we skipped.
+            parts: List[str] = []
+            for k in ("bad_card", "event_fetch_failed", "not_singles", "not_bo3", "exception"):
+                v = skip_reasons.get(k, 0)
+                if v:
+                    parts.append(f"{k}={v}")
+            extra = f"\nПричины пропуска: " + ", ".join(parts) if parts else ""
+            await send(f"Готово. Проанализировано матчей: {count} (пропущено {skipped}), время {dt}s{extra}")
 
     async def _analyze_ids(page: Page, ids: List[int]) -> None:
         print(f"[TG] analyze_ids: requested={ids}", flush=True)
