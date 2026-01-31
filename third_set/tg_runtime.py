@@ -112,13 +112,18 @@ class TelegramClient:
             return mid if isinstance(mid, int) else None
         return None
 
-    def send_text_result(self, text: str, *, parse_mode: str = "HTML") -> Dict:
+    def send_text_result(self, text: str, *, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> Dict:
         payload = {
             "chat_id": self.chat_id,
             "text": (text or "")[:3800],
             "parse_mode": parse_mode,
             "disable_web_page_preview": "true",
         }
+        if reply_markup is not None:
+            try:
+                payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            except Exception:
+                pass
         r = self._api("sendMessage", payload)
         if r.get("ok"):
             return r

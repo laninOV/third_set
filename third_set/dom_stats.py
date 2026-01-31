@@ -45,12 +45,18 @@ _ITEM_MAP: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("Service", "Двойные ошибки"): ("Service", "Double faults"),
     ("Service", "Double faults"): ("Service", "Double faults"),
     ("Service", "Первая подача"): ("Service", "First serve"),
+    ("Service", "1-я подача"): ("Service", "First serve"),
     ("Service", "First serve"): ("Service", "First serve"),
+    ("Service", "Вторая подача"): ("Service", "Second serve"),
+    ("Service", "2-я подача"): ("Service", "Second serve"),
     ("Service", "Поинты первой подачи"): ("Service", "First serve points"),
     ("Service", "First serve points"): ("Service", "First serve points"),
     ("Service", "Поинты второй подачи"): ("Service", "Second serve points"),
     ("Service", "Second serve points"): ("Service", "Second serve points"),
     ("Service", "Брейк-поинты защищены"): ("Service", "Break points saved"),
+    ("Service", "Брейк-пойнты защищены"): ("Service", "Break points saved"),
+    ("Service", "Брейк-пойнты отыграны"): ("Service", "Break points saved"),
+    ("Service", "Брейк-поинты отыграны"): ("Service", "Break points saved"),
     ("Service", "Break points saved"): ("Service", "Break points saved"),
     # Return
     ("Return", "Поинты первой подачи"): ("Return", "First serve return points"),
@@ -59,17 +65,27 @@ _ITEM_MAP: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("Return", "Second serve return points"): ("Return", "Second serve return points"),
     ("Return", "Сыграно ответных"): ("Return", "Return games played"),
     ("Return", "Сыграно ответных матчей"): ("Return", "Return games played"),
+    ("Return", "Сыгранные ответные геймы"): ("Return", "Return games played"),
+    ("Return", "Сыгранные геймы на приёме"): ("Return", "Return games played"),
+    ("Return", "Сыгранные геймы на приеме"): ("Return", "Return games played"),
     ("Return", "Return games played"): ("Return", "Return games played"),
     ("Return", "Брейк-поинты использованы"): ("Return", "Break points converted"),
+    ("Return", "Брейк-пойнты использованы"): ("Return", "Break points converted"),
+    ("Return", "Брейк-пойнты реализованы"): ("Return", "Break points converted"),
+    ("Return", "Брейк-поинты реализованы"): ("Return", "Break points converted"),
     ("Return", "Break points converted"): ("Return", "Break points converted"),
     # Points
     ("Points", "Очки на подаче"): ("Points", "Service points won"),
     ("Points", "Service points won"): ("Points", "Service points won"),
     ("Points", "Очки на приёме"): ("Points", "Receiver points won"),
+    ("Points", "Очки на приеме"): ("Points", "Receiver points won"),
+    ("Points", "Очки на своей подаче"): ("Points", "Service points won"),
+    ("Points", "Очки на подаче соперника"): ("Points", "Receiver points won"),
     ("Points", "Очки, выигранные на подаче соперника"): ("Points", "Receiver points won"),
     ("Points", "Receiver points won"): ("Points", "Receiver points won"),
     ("Points", "Очки, выигранные на своей подаче"): ("Points", "Service points won"),
     ("Points", "Очки, выигранные на приёме"): ("Points", "Receiver points won"),
+    ("Points", "Очки, выигранные на приеме"): ("Points", "Receiver points won"),
     # Games
     ("Games", "Выигранные подачи"): ("Games", "Service games won"),
     ("Games", "Service games won"): ("Games", "Service games won"),
@@ -108,6 +124,39 @@ async def _dismiss_overlays(page: Page) -> None:
     _dbg("dismiss_overlays")
     try:
         await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    # Age verification modal (Sofascore gambling ads). Choose "25 years or older" and confirm.
+    try:
+        age_dialog = page.locator(".modalRecipe__contentWrapper").filter(
+            has_text=re.compile(r"Age Verification|Проверка возраста|Подтверждение возраста", re.I)
+        )
+        if await age_dialog.count() and await age_dialog.first.is_visible():
+            dlg = age_dialog.first
+            # Click the 25+ radio input (by id) or by label text.
+            try:
+                inp = dlg.locator("input[id*='25_or_older']").first
+                if await inp.count():
+                    await inp.click(timeout=1500, force=True)
+                    await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            try:
+                label = dlg.locator("label:has-text(\"25 years or older\")").first
+                if await label.count():
+                    await label.click(timeout=1500, force=True)
+                    await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            # Click confirm button (becomes enabled after selecting).
+            try:
+                btn = dlg.locator("button:has-text(\"Подтвердить\")").first
+                if await btn.count():
+                    await btn.click(timeout=1500, force=True)
+                    await page.wait_for_timeout(350)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -353,16 +402,19 @@ async def _select_period(page: Page, period_code: str) -> bool:
             return [
                 re.compile(rf"1\s*{dash}\s*й{set_word}", re.I),
                 re.compile(r"1st(?:\s*set)?", re.I),
+                re.compile(r"^\s*1\s*$", re.I),
             ]
         if code == "2ND":
             return [
                 re.compile(rf"2\s*{dash}\s*й{set_word}", re.I),
                 re.compile(r"2nd(?:\s*set)?", re.I),
+                re.compile(r"^\s*2\s*$", re.I),
             ]
         if code == "3RD":
             return [
                 re.compile(rf"3\s*{dash}\s*й{set_word}", re.I),
                 re.compile(r"3rd(?:\s*set)?", re.I),
+                re.compile(r"^\s*3\s*$", re.I),
             ]
         return []
 
@@ -564,12 +616,24 @@ async def extract_statistics_dom(
       { "statistics": [ { "period": "1ST", "groups": [ { "groupName": "...", "statisticsItems": [...] } ] } ] }
     """
     # Ensure we are on the correct match URL (history reuses a single tab).
+    # Sofascore can redirect between locales (e.g. /ru/ -> /en-us/), so we match by the
+    # locale-independent path `/tennis/match/<slug>/<customId>` rather than full prefix.
     target = match_url + f"#id:{event_id}"
-    try:
-        cur_base = (page.url or "").split("#", 1)[0]
-    except Exception:
-        cur_base = ""
-    if not cur_base.startswith(match_url) or f"id:{event_id}" not in (page.url or ""):
+
+    def _match_identity(url: str) -> str:
+        try:
+            base = (url or "").split("#", 1)[0]
+        except Exception:
+            base = url or ""
+        m = re.search(r"/tennis/match/[^/]+/[^/?#]+", base)
+        return m.group(0) if m else ""
+
+    want_id = _match_identity(match_url)
+    have_id = _match_identity(page.url or "")
+    on_same_match = bool(want_id) and want_id == have_id
+    has_event_fragment = f"id:{event_id}" in (page.url or "")
+
+    if not on_same_match or not has_event_fragment:
         _dbg(f"goto {target}")
         await page.goto(target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
         try:
@@ -618,7 +682,7 @@ async def extract_statistics_dom(
         # Trigger lazy-loading of lower statistic blocks (Return/Games/etc).
         # Run this *after* selecting the desired period; some pages render the period switcher only at the top.
         try:
-            for _ in range(6):
+            for _ in range(3):
                 await page.mouse.wheel(0, 1600)
                 await page.wait_for_timeout(350)
             # Small scroll back up keeps header sections in view for stable DOM.
@@ -717,7 +781,13 @@ async def extract_statistics_dom(
               }
               headerEls.sort((a,b) => (a.r.y - b.r.y) || (a.r.cx - b.r.cx));
 
-              const rowSel = 'div.d_flex.ai_center.jc_space-between, div.d_flex.jc_space-between, div.jc_space-between';
+              const rowSel = [
+                'div.d_flex.ai_center.jc_space-between',
+                'div.d_flex.jc_space-between',
+                'div.jc_space-between',
+                'div[class*="statisticsRow"]',
+                'div[class*="statRow"]'
+              ].join(',');
               const rowsAll = Array.from(root.querySelectorAll(rowSel))
                 .map((el) => ({ el, r: rectOf(el) }))
                 .filter((x) => x.r && typeof x.r.y === 'number')
@@ -725,9 +795,23 @@ async def extract_statistics_dom(
 
               function parseRow(rowEl) {
                 const bdis = Array.from(rowEl.querySelectorAll('bdi'));
-                if (bdis.length < 2) return null;
-                const left = bdis[0];
-                const right = bdis[bdis.length - 1];
+                let left = null;
+                let right = null;
+                if (bdis.length >= 2) {
+                  left = bdis[0];
+                  right = bdis[bdis.length - 1];
+                }
+                // Fallback: find first/last numeric-ish text nodes in row.
+                if (!left || !right) {
+                  const nodes = Array.from(rowEl.querySelectorAll('span,div,p,strong,b'))
+                    .map((el) => ({ el, t: normText(el.textContent) }))
+                    .filter((x) => x.t);
+                  const numeric = nodes.filter((x) => /^\\d+(?:\\s*\\/\\s*\\d+)?(?:\\s*\\(\\d+%\\))?$/.test(x.t));
+                  if (numeric.length >= 2) {
+                    left = numeric[0].el;
+                    right = numeric[numeric.length - 1].el;
+                  }
+                }
                 let label =
                   rowEl.querySelector('span[class*="textStyle_assistive"]') ||
                   rowEl.querySelector('span[class*="textStyle_secondary"]');
@@ -735,7 +819,7 @@ async def extract_statistics_dom(
                   // Fallback: try to find a non-numeric center label.
                   const txts = Array.from(rowEl.querySelectorAll('span,div,p'))
                     .map((el) => ({ el, t: normText(el.textContent) }))
-                    .filter((x) => x.t && !/^\\d+(?:\\/\\d+)?(?:\\s*\\(\\d+%\\))?$/.test(x.t));
+                    .filter((x) => x.t && !/^\\d+(?:\\s*\\/\\s*\\d+)?(?:\\s*\\(\\d+%\\))?$/.test(x.t));
                   if (txts.length) label = txts[0].el;
                 }
                 if (!left || !right || !label) return null;
@@ -796,12 +880,14 @@ async def extract_statistics_dom(
         await page.wait_for_timeout(350)
         groups_raw = await scrape_current_view()
         # If the page is lazy-loading lower blocks, the first scrape may include only the top group.
-        # Only scroll if we don't see the expected set of groups.
+        # Only scroll if we don't see the key tennis groups (Service/Points/Return).
         try:
             titles = {str(g.get("title") or "").strip() for g in groups_raw if isinstance(g, dict)}
         except Exception:
             titles = set()
-        if len(groups_raw) < 4 or not ({"Подача", "Очки", "Возврат"} & titles) or not ({"Игр", "Разное"} & titles):
+        # We intentionally do NOT require "Games"/"Misc" here: Sofascore sometimes renders them far below
+        # and scrolling adds a lot of time. Our models rely primarily on Service/Points/Return.
+        if len(groups_raw) < 3 or not ({"Подача", "Очки", "Возврат"} & titles):
             await _scroll_for_full_stats()
             groups_raw = await scrape_current_view()
         if not isinstance(groups_raw, list):

@@ -14,19 +14,30 @@ from third_set.snapshot import MatchSnapshot
 from third_set.modules import (
     ModuleResult,
     module1_dominance,
+    module1_history_tpw12,
     module2_second_serve_fragility,
+    module2_history_serve,
     module3_return_pressure,
+    module3_history_return,
     module4_clutch,
+    module4_history_clutch,
     module5_form_profile,
 )
 from third_set.sofascore import (
     SofascoreError,
     get_event_votes,
     get_last_finished_singles_events,
+    get_event_from_match_url_auto,
+    get_event_from_match_url_via_navigation,
+    parse_event_id_from_match_link,
     is_singles_event,
     summarize_event_for_team,
+    warm_player_page,
+    discover_player_match_links,
+    discover_player_match_links_from_profile_url,
+    discover_player_profile_urls_from_match,
 )
-from third_set.stats_parser import get_periods_present, sum_event_value
+from third_set.stats_parser import sum_event_value
 from third_set.dom_stats import DomStatsError, extract_statistics_dom
 
 
@@ -253,26 +264,97 @@ def _signals_from_features(
     # History form signal: use TPW12 Rating (0..1) computed from last5/last3 (always numeric).
     tpw12_scores = (hist.get("tpw12_scores") or {}) if isinstance(hist, dict) else {}
 
-    def _rating_norm(side: str, key: str) -> float:
+    def _rating_norm(side: str, key: str) -> Optional[float]:
         sc = (tpw12_scores.get(side) or {}).get(key)
         if isinstance(sc, dict):
             r = sc.get("rating")
             if isinstance(r, (int, float)):
                 return _clamp(float(r) / 100.0, 0.0, 1.0)
-        return 0.5
+        return None
+
+    def _score_from_hist_mean(side: str, key: str, *, mean: float, sd: float, higher: bool = True) -> Optional[float]:
+        c = cal.get(side) if isinstance(cal, dict) else None
+        if not isinstance(c, dict):
+            return None
+        ms = c.get(key)
+        if isinstance(ms, MetricSummary):
+            v = ms.mean
+        elif isinstance(ms, dict):
+            v = ms.get("mean")
+        else:
+            v = None
+        if not isinstance(v, (int, float)):
+            return None
+        return _score_from_history(float(v), hist=None, fallback_mean=mean, fallback_sd=sd, higher_is_better=higher)
 
     strength3_h = _rating_norm("home", "last3")
     strength3_a = _rating_norm("away", "last3")
     strength5_h = _rating_norm("home", "last5")
     strength5_a = _rating_norm("away", "last5")
-    # `strength` in signals == last5 rating (our default history pool size)
-    strength_h = strength5_h
-    strength_a = strength5_a
 
-    # Form is explicit momentum: EWMA results+stats window vs baseline window.
-    # Fall back to the TPW rating delta if windowed form isn't available.
-    form_h = _form_window("home", window_n=min(5, max_history)) or strength5_h
-    form_a = _form_window("away", window_n=min(5, max_history)) or strength5_a
+    # History strength: combine TPW rating with historical serve/return/clutch quality.
+    serve_h = _weighted_score(
+        [
+            (_score_from_hist_mean("home", "ssw_12", mean=0.50, sd=0.10), 0.60),
+            (_score_from_hist_mean("home", "bpsr_12", mean=0.60, sd=0.20), 0.40),
+        ]
+    )
+    serve_a = _weighted_score(
+        [
+            (_score_from_hist_mean("away", "ssw_12", mean=0.50, sd=0.10), 0.60),
+            (_score_from_hist_mean("away", "bpsr_12", mean=0.60, sd=0.20), 0.40),
+        ]
+    )
+    ret_h = _weighted_score(
+        [
+            (_score_from_hist_mean("home", "rpr_12", mean=0.38, sd=0.06), 0.65),
+            (_score_from_hist_mean("home", "bpconv_12", mean=0.35, sd=0.20), 0.35),
+        ]
+    )
+    ret_a = _weighted_score(
+        [
+            (_score_from_hist_mean("away", "rpr_12", mean=0.38, sd=0.06), 0.65),
+            (_score_from_hist_mean("away", "bpconv_12", mean=0.35, sd=0.20), 0.35),
+        ]
+    )
+    clutch_h = _weighted_score(
+        [
+            (_score_from_hist_mean("home", "bpsr_12", mean=0.60, sd=0.25), 0.60),
+            (_score_from_hist_mean("home", "bpconv_12", mean=0.35, sd=0.25), 0.40),
+        ]
+    )
+    clutch_a = _weighted_score(
+        [
+            (_score_from_hist_mean("away", "bpsr_12", mean=0.60, sd=0.25), 0.60),
+            (_score_from_hist_mean("away", "bpconv_12", mean=0.35, sd=0.25), 0.40),
+        ]
+    )
+
+    strength_h = _weighted_score(
+        [
+            (strength5_h, 0.55),
+            (serve_h, 0.15 if serve_h is not None else 0.0),
+            (ret_h, 0.20 if ret_h is not None else 0.0),
+            (clutch_h, 0.10 if clutch_h is not None else 0.0),
+        ]
+    )
+    strength_a = _weighted_score(
+        [
+            (strength5_a, 0.55),
+            (serve_a, 0.15 if serve_a is not None else 0.0),
+            (ret_a, 0.20 if ret_a is not None else 0.0),
+            (clutch_a, 0.10 if clutch_a is not None else 0.0),
+        ]
+    )
+
+    # Form: momentum from last3 vs last5 + optional windowed form.
+    # Trend only makes sense when both windows exist; do not invent baselines.
+    trend_h = _clamp(0.5 + (strength3_h - strength5_h) * 1.2, 0.0, 1.0) if (strength3_h is not None and strength5_h is not None) else None
+    trend_a = _clamp(0.5 + (strength3_a - strength5_a) * 1.2, 0.0, 1.0) if (strength3_a is not None and strength5_a is not None) else None
+    form_win_h = _form_window("home", window_n=min(5, max_history))
+    form_win_a = _form_window("away", window_n=min(5, max_history))
+    form_h = _weighted_score([(trend_h, 0.55), (form_win_h, 0.45 if form_win_h is not None else 0.0)])
+    form_a = _weighted_score([(trend_a, 0.55), (form_win_a, 0.45 if form_win_a is not None else 0.0)])
 
     # Also expose ratings as separate signals for printing.
     form3_h = strength3_h
@@ -324,8 +406,21 @@ def _signals_from_features(
         rel = _clamp(n_min / 8.0, 0.0, 1.0)
         return (0.5 * (1.0 - rel)) + (base * rel)
 
-    stability_h = _stability("home")
-    stability_a = _stability("away")
+    # Stability: prefer TPW volatility (0..100) from last5 if present, else SD-based.
+    def _vol_to_stab(side: str) -> Optional[float]:
+        sc = (tpw12_scores.get(side) or {}).get("last5")
+        if isinstance(sc, dict):
+            v = sc.get("volatility")
+            if isinstance(v, (int, float)):
+                return _clamp(1.0 - float(v) / 100.0, 0.0, 1.0)
+        return None
+
+    stability_h = _vol_to_stab("home")
+    if stability_h is None:
+        stability_h = _stability("home")
+    stability_a = _vol_to_stab("away")
+    if stability_a is None:
+        stability_a = _stability("away")
 
     return {
         "strength": _index_pack(home=strength_h, away=strength_a),
@@ -353,8 +448,8 @@ def _probability_from_signals(
         d = it.get("diff")
         return float(d) if isinstance(d, (int, float)) else None
 
-    d_strength = g("strength") or 0.0
-    d_form = g("form") or 0.0
+    d_strength = g("strength")
+    d_form = g("form")
     d_stab = g("stability")  # optional
 
     # Module evidence: normalized into [-1..1]
@@ -369,7 +464,10 @@ def _probability_from_signals(
 
     # Base linear logit from signals
     # Strength is primary (historical rating), form is secondary (momentum).
-    x = 2.6 * d_strength + 1.4 * d_form + 1.2 * mod_norm
+    no_signal = (d_strength is None and d_form is None and active == 0)
+    ds = float(d_strength) if isinstance(d_strength, (int, float)) else 0.0
+    df = float(d_form) if isinstance(d_form, (int, float)) else 0.0
+    x = 3.0 * ds + 1.2 * df + 1.0 * mod_norm
     # Stability gates confidence more than direction: if both unstable, flatten probability.
     gate = 1.0
     if isinstance(d_stab, (int, float)):
@@ -380,9 +478,9 @@ def _probability_from_signals(
             gate = 0.70 + 0.30 * float(min(sh, sa))
     x *= gate
 
-    p_home = _sigmoid(x)
+    p_home = _sigmoid(x) if not no_signal else 0.5
     p_away = 1.0 - p_home
-    conf = abs(p_home - 0.5) * 2.0
+    conf = (abs(p_home - 0.5) * 2.0) if not no_signal else 0.0
     pick = "home" if p_home > 0.5 else "away"
     if conf < 0.08:
         pick = "neutral"
@@ -394,7 +492,7 @@ def _probability_from_signals(
         "pick": pick,
         "logit": x,
         "gate": gate,
-        "components": {"d_strength": d_strength, "d_form": d_form, "mod_norm": mod_norm, "mod_score": mod_score, "active_mods": active},
+        "components": {"d_strength": d_strength, "d_form": d_form, "mod_norm": mod_norm, "mod_score": mod_score, "active_mods": active, "no_signal": no_signal},
     }
 
 def _build_feature_dump(
@@ -682,7 +780,7 @@ def _build_feature_dump(
     )
 
     # History rating index based on TPW in sets 1+2 (0..1, baseline 0.5). No NA.
-    def _hist_rating_norm(side: str) -> float:
+    def _hist_rating_norm(side: str) -> Optional[float]:
         try:
             sc = ((hist.get("tpw12_scores") or {}).get(side) or {}).get("last5")
         except Exception:
@@ -691,7 +789,7 @@ def _build_feature_dump(
             r = sc.get("rating")
             if isinstance(r, (int, float)):
                 return _clamp(float(r) / 100.0, 0.0, 1.0)
-        return 0.5
+        return None
 
     idx["history_form_index"] = _index_pack(home=_hist_rating_norm("home"), away=_hist_rating_norm("away"))
 
@@ -729,7 +827,7 @@ def _tpw12_history_scores(rows: List[Dict[str, Any]], *, max_n: int = 5) -> Dict
     - rating (0..100): итоговая оценка
     - reliability (0..100): надёжность (по N)
 
-    Всегда возвращает числа (без NA).
+    Если данных нет (n=0) — НЕ придумывает нейтральные 50/50, а возвращает None-поля.
     """
     vals: List[float] = []
     for r in (rows or [])[: max(0, int(max_n))]:
@@ -758,13 +856,13 @@ def _tpw12_history_scores(rows: List[Dict[str, Any]], *, max_n: int = 5) -> Dict
     if n == 0:
         return {
             "n": 0,
-            "mu_pp": 0.0,
-            "delta_pp": 0.0,
-            "sigma_pp": 0.0,
-            "power": 50.0,
-            "form": 50.0,
-            "volatility": 50.0,
-            "rating": 50.0,
+            "mu_pp": None,
+            "delta_pp": None,
+            "sigma_pp": None,
+            "power": None,
+            "form": None,
+            "volatility": None,
+            "rating": None,
             "reliability": 0.0,
             "values": [],
         }
@@ -974,28 +1072,140 @@ async def _history_rows_for_player(
 async def _history_rows_for_player_audit(
     page: Page,
     *,
+    match_url: Optional[str] = None,
+    match_event_id: Optional[int] = None,
+    match_side: str = "",
     team_id: int,
+    team_slug: Optional[str] = None,
     max_history: int,
     surface_filter: Optional[str] = None,
     progress_cb: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     progress_label: str = "",
 ) -> Tuple[List[Dict[str, Any]], HistoryAudit]:
+    # Hard limits to keep analysis fast on servers.
+    # If we can't collect enough rows within budget, we return what we have (no fake filling).
+    try:
+        per_event_timeout_s = float(os.getenv("THIRDSET_HISTORY_EVENT_TIMEOUT_S") or "18")
+    except Exception:
+        per_event_timeout_s = 18.0
+    per_event_timeout_s = max(8.0, min(45.0, per_event_timeout_s))
+
+    try:
+        player_budget_s = float(os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S") or "75")
+    except Exception:
+        player_budget_s = 75.0
+    player_budget_s = max(20.0, min(180.0, player_budget_s))
+    deadline = asyncio.get_running_loop().time() + player_budget_s
+
     # We only need `max_history` valid rows. For fullness we always parse history via DOM,
     # so we fetch a larger candidate list and stop early once we collected enough rows.
-    events = await get_last_finished_singles_events(page, team_id, limit=max(max_history * 10, 60))
+    # HISTORY EVENTS SOURCE (DOM-first):
+    # We deliberately avoid /api/v1/team/<id>/events/last/* because it's often blocked (403) on servers.
+    # Instead, we open player's page and take match links from DOM, then resolve each match to its event payload.
+    events: List[Dict[str, Any]] = []
+    links: List[str] = []
+    # 1) Try the player profile URL derived from the match page DOM (most reliable; avoids 404).
+    if match_url and match_event_id and match_side in ("home", "away"):
+        try:
+            prof = await discover_player_profile_urls_from_match(page, match_url=str(match_url), event_id=int(match_event_id))
+        except Exception:
+            prof = {}
+        profile_url = prof.get(match_side) if isinstance(prof, dict) else None
+        if isinstance(profile_url, str) and profile_url:
+            try:
+                # Player pages may contain many upcoming/live matches first; we need enough depth to reach finished ones.
+                links = await discover_player_match_links_from_profile_url(
+                    page, profile_url=profile_url, limit=max(max_history * 50, 200)
+                )
+            except Exception:
+                links = []
+    # 2) Fallback within DOM-only approach: try constructing the profile URL from slug/id (can 404).
+    if not links and isinstance(team_slug, str) and team_slug.strip():
+        try:
+            links = await discover_player_match_links(
+                page, team_id=int(team_id), team_slug=str(team_slug), limit=max(max_history * 50, 200)
+            )
+        except Exception:
+            links = []
+        # Resolve only as much as needed (finished singles), respecting time budget.
+        for link in links:
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            try:
+                link_s = str(link)
+                eid = parse_event_id_from_match_link(link_s)
+                if isinstance(eid, int):
+                    base = link_s.split("#", 1)[0]
+                    payload = await asyncio.wait_for(
+                        get_event_from_match_url_via_navigation(page, match_url=base, event_id=int(eid)),
+                        timeout=12.0,
+                    )
+                else:
+                    payload = await asyncio.wait_for(get_event_from_match_url_auto(page, link_s), timeout=12.0)
+                ev = payload.get("event") if isinstance(payload, dict) else None
+                if not isinstance(ev, dict):
+                    continue
+                status = (ev.get("status") or {}).get("type")
+                if str(status or "").lower() != "finished":
+                    continue
+                if not is_singles_event(ev):
+                    continue
+                events.append(ev)
+                if len(events) >= max(max_history * 6, 30):
+                    break
+            except Exception:
+                continue
+    elif links:
+        # Resolve only as much as needed (finished singles), respecting time budget.
+        for link in links:
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            try:
+                link_s = str(link)
+                eid = parse_event_id_from_match_link(link_s)
+                if isinstance(eid, int):
+                    base = link_s.split("#", 1)[0]
+                    payload = await asyncio.wait_for(
+                        get_event_from_match_url_via_navigation(page, match_url=base, event_id=int(eid)),
+                        timeout=12.0,
+                    )
+                else:
+                    payload = await asyncio.wait_for(get_event_from_match_url_auto(page, link_s), timeout=12.0)
+                ev = payload.get("event") if isinstance(payload, dict) else None
+                if not isinstance(ev, dict):
+                    continue
+                status = (ev.get("status") or {}).get("type")
+                if str(status or "").lower() != "finished":
+                    continue
+                if not is_singles_event(ev):
+                    continue
+                events.append(ev)
+                if len(events) >= max(max_history * 6, 30):
+                    break
+            except Exception:
+                continue
+
+    # No API fallbacks for history candidates: source of truth is player page DOM.
     if surface_filter:
         sf = normalize_surface(surface_filter)
     else:
         sf = None
-    # DOM parsing opens match pages; keep it sequential for stability.
-    sem = asyncio.Semaphore(1)
-    hist_page: Optional[Page] = None
+    # DOM parsing opens match pages; allow limited parallelism (2 by default) for speed.
     try:
-        hist_page = await page.context.new_page()
+        workers = int(os.getenv("THIRDSET_HISTORY_WORKERS", "2"))
     except Exception:
-        hist_page = None
+        workers = 2
+    workers = max(1, min(4, workers))
+    hist_pages: List[Page] = []
+    try:
+        for _ in range(workers):
+            hist_pages.append(await page.context.new_page())
+    except Exception:
+        hist_pages = []
+    if not hist_pages:
+        workers = 1
 
-    async def one(idx: int, ev: Dict[str, Any]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+    async def one(idx: int, ev: Dict[str, Any], *, hist_page: Optional[Page]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
         eid = ev.get("id")
         if not eid:
             return idx, None, "missing_event_id", {}
@@ -1029,23 +1239,33 @@ async def _history_rows_for_player_audit(
         if sf and surface != sf:
             return idx, None, "surface_mismatch", summary
 
-        # Always use DOM for history (fullness > speed; avoids API inconsistencies).
+        # History statistics: STRICT DOM-only.
+        # User requirement: maximum completeness and CF stability; no /api/v1/... fetches for history stats.
         stats = None
         dom_used = False
         dom_err: Optional[str] = None
-        async with sem:
+        if hist_page is not None:
             try:
                 slug = ev.get("slug")
                 custom = ev.get("customId")
-                if slug and custom and hist_page is not None:
+                if slug and custom:
                     url = f"https://www.sofascore.com/ru/tennis/match/{slug}/{custom}"
-                    # If the match ended 2:0, don't waste time trying to select 3RD.
-                    periods = ("1ST", "2ND", "3RD") if has_set3 else ("1ST", "2ND")
+                else:
+                    url = f"https://www.sofascore.com/event/{int(eid)}"
+                periods = ("1ST", "2ND", "3RD") if has_set3 else ("1ST", "2ND")
+                try:
                     stats = await asyncio.wait_for(
                         extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
-                        timeout=45.0,
+                        timeout=per_event_timeout_s,
                     )
-                    dom_used = True
+                except asyncio.TimeoutError:
+                    retry_t = min(45.0, max(per_event_timeout_s * 2.0, per_event_timeout_s + 8.0))
+                    stats = await asyncio.wait_for(
+                        extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
+                        timeout=retry_t,
+                    )
+                dom_used = True
+                dom_err = None
             except Exception as ex:
                 dom_err = f"{type(ex).__name__}: {ex}"
                 stats = None
@@ -1186,42 +1406,90 @@ async def _history_rows_for_player_audit(
     excluded_events: List[Dict[str, Any]] = []
     valid_rows: List[Dict[str, Any]] = []
     scanned = 0
-    for i, ev in enumerate(events):
-        idx, row, reason, summary = await one(i, ev)
-        scanned += 1
-        if reason is not None:
-            excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
-            if len(excluded_events) < 12:
-                excluded_events.append(
-                    {
-                        "eventId": summary.get("eventId") if isinstance(summary, dict) else None,
-                        "opponentName": (summary or {}).get("opponentName") if isinstance(summary, dict) else None,
-                        "tournament": (summary or {}).get("tournament") if isinstance(summary, dict) else None,
-                        "reason": reason,
-                        "dom_error": (summary or {}).get("dom_error") if isinstance(summary, dict) else None,
-                    }
-                )
-        elif row is None:
-            excluded_by_reason["unknown_drop"] = excluded_by_reason.get("unknown_drop", 0) + 1
-        else:
-            valid_rows.append(row)
-            if progress_cb is not None:
-                try:
-                    await progress_cb(
+
+    # Parallel scheduler: keep up to `workers` tasks in flight.
+    tasks: set = set()
+    ev_iter = iter(list(enumerate(events)))
+
+    def _next_page(i: int) -> Optional[Page]:
+        if not hist_pages:
+            return None
+        return hist_pages[i % len(hist_pages)]
+
+    async def _launch_next() -> bool:
+        nonlocal tasks
+        # Stop scheduling new work if we exceeded the budget.
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        try:
+            i, ev = next(ev_iter)
+        except StopIteration:
+            return False
+        t = asyncio.create_task(one(i, ev, hist_page=_next_page(i)))
+        tasks.add(t)
+        return True
+
+    # Prime initial tasks
+    for _ in range(workers):
+        if not await _launch_next():
+            break
+
+    while tasks:
+        # Budget stop: cancel all in-flight tasks and return whatever we collected so far.
+        if asyncio.get_running_loop().time() >= deadline:
+            for t in tasks:
+                t.cancel()
+            tasks.clear()
+            excluded_by_reason["budget_exceeded"] = excluded_by_reason.get("budget_exceeded", 0) + 1
+            break
+        done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            idx, row, reason, summary = t.result()
+            scanned += 1
+            if reason is not None:
+                excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
+                if len(excluded_events) < 12:
+                    excluded_events.append(
                         {
-                            "label": progress_label,
-                            "team_id": team_id,
-                            "target": int(max_history),
-                            "have": int(len(valid_rows)),
-                            "scanned": int(scanned),
-                            "eventId": row.get("eventId"),
-                            "opponent": row.get("opponentName"),
+                            "eventId": summary.get("eventId") if isinstance(summary, dict) else None,
+                            "opponentName": (summary or {}).get("opponentName") if isinstance(summary, dict) else None,
+                            "tournament": (summary or {}).get("tournament") if isinstance(summary, dict) else None,
+                            "reason": reason,
+                            "dom_error": (summary or {}).get("dom_error") if isinstance(summary, dict) else None,
                         }
                     )
-                except Exception:
-                    pass
+            elif row is None:
+                excluded_by_reason["unknown_drop"] = excluded_by_reason.get("unknown_drop", 0) + 1
+            else:
+                valid_rows.append((idx, row))
+                if progress_cb is not None:
+                    try:
+                        await progress_cb(
+                            {
+                                "label": progress_label,
+                                "team_id": team_id,
+                                "target": int(max_history),
+                                "have": int(len(valid_rows)),
+                                "scanned": int(scanned),
+                                "eventId": row.get("eventId"),
+                                "opponent": row.get("opponentName"),
+                            }
+                        )
+                    except Exception:
+                        pass
+            # Launch next task if we still need more rows.
+            if len(valid_rows) < max_history:
+                await _launch_next()
+
         if len(valid_rows) >= max_history:
+            # Cancel any remaining tasks; we have enough.
+            for t in tasks:
+                t.cancel()
+            tasks.clear()
             break
+
+    # Sort by original index (newest first) and trim.
+    valid_rows = [r for _i, r in sorted(valid_rows, key=lambda x: x[0])]
 
     used_rows = valid_rows[:max_history]
     over_max_history = max(0, len(valid_rows) - len(used_rows))
@@ -1287,8 +1555,8 @@ async def _history_rows_for_player_audit(
         coverage=coverage,
     )
     try:
-        if hist_page is not None:
-            await hist_page.close()
+        for p in hist_pages:
+            await p.close()
     except Exception:
         pass
     return used_rows, audit
@@ -1509,22 +1777,73 @@ async def analyze_once(
     # User wants strict recency. We collect exactly `max_history` per player and compute both last3 and last5
     # windows from that same pool (so dynamics are visible without “размывания”).
     history_pool = int(max_history)
-    _dbg(f"History: home teamId={ctx.home_id} max={history_pool}")
-    rows_home_pool, audit_home = await _history_rows_for_player_audit(
-        page,
-        team_id=ctx.home_id,
-        max_history=history_pool,
-        progress_cb=progress_cb,
-        progress_label="home",
-    )
-    _dbg(f"History: away teamId={ctx.away_id} max={history_pool}")
-    rows_away_pool, audit_away = await _history_rows_for_player_audit(
-        page,
-        team_id=ctx.away_id,
-        max_history=history_pool,
-        progress_cb=progress_cb,
-        progress_label="away",
-    )
+    # History DOM scraping is the slowest step. Run both players concurrently on separate tabs
+    # so navigations/DOM work don't block each other.
+    _dbg(f"History: pool={history_pool} (parallel home+away)")
+    home_page: Optional[Page] = None
+    away_page: Optional[Page] = None
+    try:
+        home_page = await page.context.new_page()
+        away_page = await page.context.new_page()
+    except Exception:
+        home_page = None
+        away_page = None
+
+    async def _hist(p: Page, team_id: int, label: str):
+        return await _history_rows_for_player_audit(
+            p,
+            match_url=match_url,
+            match_event_id=event_id,
+            match_side=label,
+            team_id=team_id,
+            team_slug=(home.get("slug") if label == "home" else away.get("slug")),
+            max_history=history_pool,
+            progress_cb=progress_cb,
+            progress_label=label,
+        )
+
+    try:
+        if home_page is not None and away_page is not None:
+            (rows_home_pool, audit_home), (rows_away_pool, audit_away) = await asyncio.gather(
+                _hist(home_page, ctx.home_id, "home"),
+                _hist(away_page, ctx.away_id, "away"),
+            )
+        else:
+            _dbg(f"History: home teamId={ctx.home_id} max={history_pool}")
+            rows_home_pool, audit_home = await _history_rows_for_player_audit(
+                page,
+                match_url=match_url,
+                match_event_id=event_id,
+                match_side="home",
+                team_id=ctx.home_id,
+                team_slug=str(home.get("slug") or ""),
+                max_history=history_pool,
+                progress_cb=progress_cb,
+                progress_label="home",
+            )
+            _dbg(f"History: away teamId={ctx.away_id} max={history_pool}")
+            rows_away_pool, audit_away = await _history_rows_for_player_audit(
+                page,
+                match_url=match_url,
+                match_event_id=event_id,
+                match_side="away",
+                team_id=ctx.away_id,
+                team_slug=str(away.get("slug") or ""),
+                max_history=history_pool,
+                progress_cb=progress_cb,
+                progress_label="away",
+            )
+    finally:
+        try:
+            if home_page is not None:
+                await home_page.close()
+        except Exception:
+            pass
+        try:
+            if away_page is not None:
+                await away_page.close()
+        except Exception:
+            pass
     pool_n = min(len(rows_home_pool), len(rows_away_pool), history_pool)
     if len(rows_home_pool) > pool_n:
         audit_home.dropped_to_match_opponent = len(rows_home_pool) - pool_n
@@ -1536,26 +1855,9 @@ async def analyze_once(
     recent_n = min(pool_n, int(max_history))
     rows_home_recent = rows_home_pool[:recent_n]
     rows_away_recent = rows_away_pool[:recent_n]
-
-    def _select_recent_with_stats(rows: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-        # Keep recency order, but prefer rows where at least some stats are available
-        # (missing_all_metrics=False). Fill with the rest if needed.
-        if n <= 0:
-            return []
-        good: List[Dict[str, Any]] = []
-        bad: List[Dict[str, Any]] = []
-        for r in rows:
-            if bool(r.get("missing_all_metrics")) is False:
-                good.append(r)
-            else:
-                bad.append(r)
-        out = (good + bad)[:n]
-        return out
-
-    # For summary/form signals we want last-N, but if within last-N Sofascore
-    # doesn't provide usable stats, fill from slightly older matches (still within pool).
-    rows_home_form = _select_recent_with_stats(rows_home_pool, recent_n)
-    rows_away_form = _select_recent_with_stats(rows_away_pool, recent_n)
+    # For summary/form signals we always use the freshest last-N (no substitution from older matches).
+    rows_home_form = rows_home_recent
+    rows_away_form = rows_away_recent
 
     m1_hist_home, m1_hist_away = _build_m1_history_profiles(rows_home_recent, rows_away_recent)
     # Calibration prefers more samples.
@@ -1563,15 +1865,30 @@ async def analyze_once(
     cal_away = build_surface_calibration(rows_away_pool, surface=surface)
 
     mods: List[ModuleResult] = []
-    if points is None:
-        mods.append(
-            ModuleResult("M1_dominance", "neutral", 0, ["missing points stats for 1ST+2ND"], ["missing_points_stats"])
-        )
+    if history_only:
+        # History-only: do not use current match stats at all.
+        h5 = _tpw12_history_scores(rows_home_form, max_n=5)
+        a5 = _tpw12_history_scores(rows_away_form, max_n=5)
+        r5h = h5.get("rating") if isinstance(h5, dict) else None
+        r5a = a5.get("rating") if isinstance(a5, dict) else None
+        mods.append(module1_history_tpw12(rating5_home=r5h, rating5_away=r5a))
+        mods.append(module2_history_serve(cal_home=cal_home, cal_away=cal_away))
+        mods.append(module3_history_return(cal_home=cal_home, cal_away=cal_away))
+        mods.append(module4_history_clutch(cal_home=cal_home, cal_away=cal_away))
     else:
-        mods.append(module1_dominance(points_1st2nd=points, history_home=m1_hist_home, history_away=m1_hist_away))
-    mods.append(module2_second_serve_fragility(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
-    mods.append(module3_return_pressure(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
-    mods.append(module4_clutch(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
+        # Live 1:1 after two sets: current stats + history calibration.
+        if points is None:
+            mods.append(
+                ModuleResult(
+                    "M1_dominance", "neutral", 0, ["missing points stats for 1ST+2ND"], ["missing_points_stats"]
+                )
+            )
+        else:
+            mods.append(module1_dominance(points_1st2nd=points, history_home=m1_hist_home, history_away=m1_hist_away))
+        mods.append(module2_second_serve_fragility(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
+        mods.append(module3_return_pressure(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
+        mods.append(module4_clutch(snapshot=snap, cal_home=cal_home, cal_away=cal_away))
+
     mods.append(
         module5_form_profile(
             history_rows_home=rows_home_pool,
@@ -1581,6 +1898,16 @@ async def analyze_once(
             cal_away=cal_away,
         )
     )
+
+    # No "stat filling": if we're in history-only mode and even TPW(1+2) history is missing,
+    # abort this match early (user wants a clear "insufficient stats" instead of 50/50 noise).
+    if history_only:
+        try:
+            m1 = mods[0]
+        except Exception:
+            m1 = None
+        if isinstance(m1, ModuleResult) and ("rating5_missing" in (m1.flags or [])):
+            raise SofascoreError("Недостаточно статистики по истории (TPW 1+2).")
 
     final_side, score, meta = ensemble(mods)
     meta["history_n"] = recent_n

@@ -53,6 +53,153 @@ def _side_from_value(value: float, *, eps: float) -> str:
         return "away"
     return "neutral"
 
+def _metric_mean_n(cal: Optional[Dict[str, MetricSummary]], key: str) -> Tuple[Optional[float], int]:
+    if not isinstance(cal, dict):
+        return None, 0
+    ms = cal.get(key)
+    if isinstance(ms, MetricSummary):
+        v = ms.mean
+        n = ms.n
+    elif isinstance(ms, dict):
+        v = ms.get("mean")
+        n = ms.get("n")
+    else:
+        v, n = None, 0
+    if not isinstance(v, (int, float)):
+        return None, int(n or 0)
+    return float(v), int(n or 0)
+
+def _strength_from_pp(diff_pp: float, *, n_min: int, bands: Tuple[float, float, float]) -> int:
+    """
+    Map a percentage-point diff into 0..3 with an n-based cap.
+    bands = (weak, medium, strong) thresholds in pp.
+    """
+    weak, med, strong = bands
+    d = abs(float(diff_pp))
+    s = 0
+    if d >= strong:
+        s = 3
+    elif d >= med:
+        s = 2
+    elif d >= weak:
+        s = 1
+    # Low sample -> cap strength
+    if n_min < 3:
+        s = min(s, 1)
+    elif n_min < 5:
+        s = min(s, 2)
+    return _cap_strength(s)
+
+def module1_history_tpw12(
+    *,
+    rating5_home: Optional[float],
+    rating5_away: Optional[float],
+) -> ModuleResult:
+    """
+    History-only dominance using TPW(sets1+2) Rating (0..100) from last5.
+    No current-match stats involved.
+    """
+    flags: List[str] = ["history_only"]
+    explain: List[str] = []
+    if rating5_home is None or rating5_away is None:
+        return ModuleResult("M1_dominance", "neutral", 0, ["rating5 missing"], ["history_only", "rating5_missing"])
+    diff = float(rating5_home) - float(rating5_away)
+    side = "home" if diff > 0 else "away" if diff < 0 else "neutral"
+    # Rating is 0..100, so pp==points.
+    strength = 0
+    ad = abs(diff)
+    if ad >= 35:
+        strength = 3
+    elif ad >= 20:
+        strength = 2
+    elif ad >= 10:
+        strength = 1
+    explain.append(f"rating5={int(round(rating5_home))}/{int(round(rating5_away))} diff={diff:+.0f}")
+    return ModuleResult("M1_dominance", side if strength > 0 else "neutral", _cap_strength(strength), explain, flags + ([] if strength > 0 else ["neutral_small_diff"]))
+
+
+def module2_history_serve(*, cal_home: Optional[Dict[str, MetricSummary]], cal_away: Optional[Dict[str, MetricSummary]]) -> ModuleResult:
+    """
+    History-only serve quality:
+    - SSW12 (2nd serve points won) mean
+    - BPSR12 (break points saved) mean
+    """
+    flags: List[str] = ["history_only"]
+    explain: List[str] = []
+    ssw_h, n_ssw_h = _metric_mean_n(cal_home, "ssw_12")
+    ssw_a, n_ssw_a = _metric_mean_n(cal_away, "ssw_12")
+    bps_h, n_bps_h = _metric_mean_n(cal_home, "bpsr_12")
+    bps_a, n_bps_a = _metric_mean_n(cal_away, "bpsr_12")
+    if ssw_h is None or ssw_a is None:
+        flags.append("ssw_missing")
+    if bps_h is None or bps_a is None:
+        flags.append("bpsr_missing")
+    # Composite in pp (0..100): 70% SSW + 30% BPSR
+    comp_h = _weighted_mean([(ssw_h, 0.70), (bps_h, 0.30)])
+    comp_a = _weighted_mean([(ssw_a, 0.70), (bps_a, 0.30)])
+    if comp_h is None or comp_a is None:
+        return ModuleResult("M2_second_serve", "neutral", 0, ["serve hist missing"], flags + ["missing_fields"])
+    diff_pp = (comp_h - comp_a) * 100.0
+    n_min = min(n_ssw_h, n_ssw_a, n_bps_h or 99, n_bps_a or 99)
+    strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(3.0, 5.0, 8.0))
+    side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
+    explain.append(f"SSW12={ssw_h:.3f}/{ssw_a:.3f} n={min(n_ssw_h,n_ssw_a)}")
+    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} n={min(n_bps_h,n_bps_a)}")
+    explain.append(f"CompositeServe={diff_pp:+.1f}pp")
+    return ModuleResult("M2_second_serve", side if strength > 0 else "neutral", strength, explain, flags)
+
+
+def module3_history_return(*, cal_home: Optional[Dict[str, MetricSummary]], cal_away: Optional[Dict[str, MetricSummary]]) -> ModuleResult:
+    """
+    History-only return pressure:
+    - RPR12 (return points won rate) mean
+    - BPconv12 (break points converted rate) mean
+    """
+    flags: List[str] = ["history_only"]
+    explain: List[str] = []
+    rpr_h, n_rpr_h = _metric_mean_n(cal_home, "rpr_12")
+    rpr_a, n_rpr_a = _metric_mean_n(cal_away, "rpr_12")
+    bpc_h, n_bpc_h = _metric_mean_n(cal_home, "bpconv_12")
+    bpc_a, n_bpc_a = _metric_mean_n(cal_away, "bpconv_12")
+    comp_h = _weighted_mean([(rpr_h, 0.70), (bpc_h, 0.30)])
+    comp_a = _weighted_mean([(rpr_a, 0.70), (bpc_a, 0.30)])
+    if comp_h is None or comp_a is None:
+        return ModuleResult("M3_return_pressure", "neutral", 0, ["return hist missing"], flags + ["missing_fields"])
+    diff_pp = (comp_h - comp_a) * 100.0
+    n_min = min(n_rpr_h, n_rpr_a, n_bpc_h or 99, n_bpc_a or 99)
+    strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(3.0, 5.0, 8.0))
+    side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
+    explain.append(f"RPR12={rpr_h if rpr_h is not None else None}/{rpr_a if rpr_a is not None else None} n={min(n_rpr_h,n_rpr_a)}")
+    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} n={min(n_bpc_h,n_bpc_a)}")
+    explain.append(f"CompositeReturn={diff_pp:+.1f}pp")
+    return ModuleResult("M3_return_pressure", side if strength > 0 else "neutral", strength, explain, flags)
+
+
+def module4_history_clutch(*, cal_home: Optional[Dict[str, MetricSummary]], cal_away: Optional[Dict[str, MetricSummary]]) -> ModuleResult:
+    """
+    History-only clutch:
+    - BPSR12 mean
+    - BPconv12 mean
+    """
+    flags: List[str] = ["history_only"]
+    explain: List[str] = []
+    bps_h, n_bps_h = _metric_mean_n(cal_home, "bpsr_12")
+    bps_a, n_bps_a = _metric_mean_n(cal_away, "bpsr_12")
+    bpc_h, n_bpc_h = _metric_mean_n(cal_home, "bpconv_12")
+    bpc_a, n_bpc_a = _metric_mean_n(cal_away, "bpconv_12")
+    comp_h = _weighted_mean([(bps_h, 0.55), (bpc_h, 0.45)])
+    comp_a = _weighted_mean([(bps_a, 0.55), (bpc_a, 0.45)])
+    if comp_h is None or comp_a is None:
+        return ModuleResult("M4_clutch", "neutral", 0, ["clutch hist missing"], flags + ["missing_fields"])
+    diff_pp = (comp_h - comp_a) * 100.0
+    n_min = min(n_bps_h, n_bps_a, n_bpc_h or 99, n_bpc_a or 99)
+    strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(4.0, 7.0, 12.0))
+    side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
+    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} n={min(n_bps_h,n_bps_a)}")
+    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} n={min(n_bpc_h,n_bpc_a)}")
+    explain.append(f"CompositeClutch={diff_pp:+.1f}pp")
+    return ModuleResult("M4_clutch", side if strength > 0 else "neutral", strength, explain, flags)
+
 
 def module1_dominance(
     *,

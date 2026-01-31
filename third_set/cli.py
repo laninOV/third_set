@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import os.path
 from pathlib import Path
 from typing import Any, List, Optional
 from html import escape as _html_escape
@@ -19,8 +20,13 @@ from third_set.sofascore import (
     LiveEvent,
     SofascoreError,
     discover_match_links,
+    discover_live_cards_dom,
+    get_live_events,
+    get_live_events_via_navigation,
     get_live_match_links,
     get_event,
+    get_event_via_navigation,
+    get_event_from_match_url_auto,
     get_event_from_match_url_via_navigation,
     get_event_statistics,
     get_last_finished_singles_events,
@@ -298,17 +304,21 @@ def _format_tg_message(
             key = "last3" if window == "3" else "last5"
             it = s.get(key)
             if not isinstance(it, dict):
-                return "50"
+                return "—"
             r = it.get("rating")
-            return str(int(round(float(r)))) if isinstance(r, (int, float)) else "50"
+            return str(int(round(float(r)))) if isinstance(r, (int, float)) else "—"
 
         def _tpw_trend(side: str) -> str:
             try:
-                r3 = int(_tpw_rating(side, "3"))
-                r5 = int(_tpw_rating(side, "5"))
+                r3s = _tpw_rating(side, "3")
+                r5s = _tpw_rating(side, "5")
+                if not (r3s.isdigit() and r5s.isdigit()):
+                    return "—"
+                r3 = int(r3s)
+                r5 = int(r5s)
                 return f"{r3 - r5:+d}"
             except Exception:
-                return "0"
+                return "—"
 
         def _mods_line(name: str) -> str:
             # Per-module compact comparison (no walls of numbers).
@@ -403,9 +413,7 @@ def _format_tg_message(
 
             return f"1сет={_r(s1.get('rate'), s1.get('n'))} 2сет={_r(s2.get('rate'), s2.get('n'))} решающие={_r(d, dn)}"
 
-        lines.append("")
-        lines.append("<b>Таблица (история)</b>")
-
+        # Compact, readable output: show only key numbers + deltas (who is higher).
         def _clip(s: str, w: int) -> str:
             s = (s or "").strip()
             if len(s) <= w:
@@ -414,91 +422,169 @@ def _format_tg_message(
                 return s[:w]
             return s[: max(0, w - 1)] + "…"
 
-        def _col(s: str, w: int) -> str:
-            s = s or ""
-            if len(s) >= w:
-                return s[:w]
-            return s + (" " * (w - len(s)))
+        def _win_of(diff: Optional[float]) -> str:
+            if diff is None:
+                return "—"
+            if diff > 0:
+                return "1"
+            if diff < 0:
+                return "2"
+            return "нейтр"
 
-        n1 = _clip(home_name, 16)
-        n2 = _clip(away_name, 16)
-        col1 = max(10, len("1) " + n1))
-        col2 = max(10, len("2) " + n2))
-        colm = 18
+        def _pp_int(x: Any) -> Optional[int]:
+            if not isinstance(x, (int, float)):
+                return None
+            return int(round(float(x) * 100.0))
 
-        def row(metric: str, v1: str, v2: str) -> str:
-            return f"{_col(metric, colm)} {_col(v1, col1)} {_col(v2, col2)}"
+        # Key metrics as raw strings (history means + counts)
+        def _metric_triplet(label: str, key: str, *, side_key: str = "home") -> tuple[str, str, str, Optional[float]]:
+            a = _hist_metric("home", key)
+            b = _hist_metric("away", key)
+            # Try to compute diff in percentage points if numeric.
+            # _hist_metric returns like "57%[n=10]" or "—[n=0]"
+            def _to_pct(s: str) -> Optional[float]:
+                m = re.search(r"(\d+(?:\.\d+)?)%", s)
+                return float(m.group(1)) if m else None
+            da = _to_pct(a)
+            db = _to_pct(b)
+            diff = (da - db) if (da is not None and db is not None) else None
+            return label, a, b, diff
 
-        t: List[str] = []
-        t.append(row("метрика", "1) " + n1, "2) " + n2))
-        t.append(row("сила last5", _tpw_rating("home", "5"), _tpw_rating("away", "5")))
-        t.append(row("сила last3", _tpw_rating("home", "3"), _tpw_rating("away", "3")))
-        t.append(row("динамика 3-5", _tpw_trend("home"), _tpw_trend("away")))
-        t.append(row("стабильность", _s100(_sig("home", "stability")), _s100(_sig("away", "stability"))))
-        t.append(row("подача SSW12", _hist_metric("home", "ssw_12"), _hist_metric("away", "ssw_12")))
-        t.append(row("приём RPR12", _hist_metric("home", "rpr_12"), _hist_metric("away", "rpr_12")))
-        t.append(row("клатч BPSR12", _hist_metric("home", "bpsr_12"), _hist_metric("away", "bpsr_12")))
-        t.append(row("клатч BPc12", _hist_metric("home", "bpconv_12"), _hist_metric("away", "bpconv_12")))
+        # Rating diffs
+        def _as_int(s: str) -> Optional[int]:
+            try:
+                return int(s) if str(s).isdigit() else None
+            except Exception:
+                return None
+        r5h = _as_int(_tpw_rating("home", "5"))
+        r5a = _as_int(_tpw_rating("away", "5"))
+        r3h = _as_int(_tpw_rating("home", "3"))
+        r3a = _as_int(_tpw_rating("away", "3"))
+        dr5 = (r5h - r5a) if (r5h is not None and r5a is not None) else None
+        dr3 = (r3h - r3a) if (r3h is not None and r3a is not None) else None
 
-        def _set_rate(side: str, key: str) -> str:
+        st_h = _pp_int(_sig("home", "stability"))
+        st_a = _pp_int(_sig("away", "stability"))
+        dst = (st_h - st_a) if (st_h is not None and st_a is not None) else None
+
+        key_metrics = [
+            ("rating5 (сила)", f"{r5h if r5h is not None else '—'}", f"{r5a if r5a is not None else '—'}", float(dr5) if dr5 is not None else None),
+            ("rating3 (сила)", f"{r3h if r3h is not None else '—'}", f"{r3a if r3a is not None else '—'}", float(dr3) if dr3 is not None else None),
+            ("стабильность", f"{st_h if st_h is not None else '—'}", f"{st_a if st_a is not None else '—'}", float(dst) if dst is not None else None),
+        ]
+        for lab, key in (
+            ("подача SSW12", "ssw_12"),
+            ("приём RPR12", "rpr_12"),
+            ("клатч BPSR12", "bpsr_12"),
+            ("клатч BPconv12", "bpconv_12"),
+        ):
+            key_metrics.append(_metric_triplet(lab, key))
+
+        # Set win rates
+        def _rate(side: str, k: str) -> Optional[float]:
             it = hist.get(side)
             if not isinstance(it, dict):
-                return "—"
-            s = it.get(key) if isinstance(it.get(key), dict) else {}
-            r = s.get("rate")
-            n = s.get("n")
-            if not isinstance(r, (int, float)) or not isinstance(n, int) or n <= 0:
-                return "—"
-            return f"{int(round(float(r)*100))}%({n})"
+                return None
+            if k == "dec":
+                r = it.get("dec_rate")
+            else:
+                s = it.get(k) if isinstance(it.get(k), dict) else {}
+                r = s.get("rate")
+            return float(r) * 100.0 if isinstance(r, (int, float)) else None
 
-        def _dec_rate(side: str) -> str:
-            it = hist.get(side)
-            if not isinstance(it, dict):
-                return "—"
-            r = it.get("dec_rate")
-            n = it.get("deciders")
-            if not isinstance(r, (int, float)) or not isinstance(n, int) or n <= 0:
-                return "—"
-            return f"{int(round(float(r)*100))}%({n})"
+        s1h, s1a = _rate("home", "set1"), _rate("away", "set1")
+        s2h, s2a = _rate("home", "set2"), _rate("away", "set2")
+        deh, dea = _rate("home", "dec"), _rate("away", "dec")
+        if s1h is not None or s1a is not None:
+            key_metrics.append(("сет1 WR", f"{int(round(s1h))}%" if s1h is not None else "—", f"{int(round(s1a))}%" if s1a is not None else "—", (s1h - s1a) if (s1h is not None and s1a is not None) else None))
+        if s2h is not None or s2a is not None:
+            key_metrics.append(("сет2 WR", f"{int(round(s2h))}%" if s2h is not None else "—", f"{int(round(s2a))}%" if s2a is not None else "—", (s2h - s2a) if (s2h is not None and s2a is not None) else None))
+        if deh is not None or dea is not None:
+            key_metrics.append(("решающие WR", f"{int(round(deh))}%" if deh is not None else "—", f"{int(round(dea))}%" if dea is not None else "—", (deh - dea) if (deh is not None and dea is not None) else None))
 
-        t.append(row("сет1 WR", _set_rate("home", "set1"), _set_rate("away", "set1")))
-        t.append(row("сет2 WR", _set_rate("home", "set2"), _set_rate("away", "set2")))
-        t.append(row("решающие WR", _dec_rate("home"), _dec_rate("away")))
-        lines.append("<code>" + "\n".join(_html_escape(x) for x in t) + "</code>")
-
+        # Build compact readable lines (NO ASCII tables for TG).
+        n1 = _clip(home_name, 14)
+        n2 = _clip(away_name, 14)
         lines.append("")
-        lines.append("<b>Модели</b>")
+        lines.append("<b>Сравнение (история)</b>")
+        lines.append(f"<b>1</b>={_html_escape(n1)} | <b>2</b>={_html_escape(n2)}")
+        for lab, a, b, diff in key_metrics:
+            if diff is None:
+                d = "—"
+                w = "—"
+            else:
+                if lab.startswith("rating"):
+                    d = f"{int(round(diff)):+d}"
+                else:
+                    d = f"{diff:+.0f}пп"
+                w = _win_of(diff)
+            lines.append(f"- {_html_escape(lab)}: { _html_escape(str(a)) } vs { _html_escape(str(b)) } | Δ={_html_escape(d)} | выше={_html_escape(w)}")
 
+        # Compact module status (one line)
+        by_name = {m.name: m for m in (mods or []) if hasattr(m, "name")}
         def _side_ru(s: str) -> str:
             return {"home": "1", "away": "2", "neutral": "нейтр"}.get(s, "нейтр")
-
-        mod_tbl: List[str] = []
-        mod_tbl.append(row("модель", "победа/сила", "ключевые"))
-        for name, ru in [
-            ("M1_dominance", "M1 доминирование"),
-            ("M2_second_serve", "M2 подача"),
+        mod_parts: List[str] = []
+        for k, ru in [
+            ("M1_dominance", "M1 дом"),
+            ("M2_second_serve", "M2 под"),
             ("M3_return_pressure", "M3 приём"),
             ("M4_clutch", "M4 клатч"),
             ("M5_form_profile", "M5 форма"),
         ]:
-            by_name = {m.name: m for m in (mods or []) if hasattr(m, "name")}
-            m = by_name.get(name)
+            m = by_name.get(k)
             if not m:
                 continue
-            left = f"{_side_ru(m.side)}/{int(m.strength or 0)}"
-            key = ""
-            if name == "M1_dominance":
-                key = f"rating5={_tpw_rating('home','5')}/{_tpw_rating('away','5')}"
-            elif name == "M2_second_serve":
-                key = f"SSW12={_hist_metric('home','ssw_12')}/{_hist_metric('away','ssw_12')}"
-            elif name == "M3_return_pressure":
-                key = f"RPR12={_hist_metric('home','rpr_12')}/{_hist_metric('away','rpr_12')}"
-            elif name == "M4_clutch":
-                key = f"BPSR12={_hist_metric('home','bpsr_12')}/{_hist_metric('away','bpsr_12')}"
-            elif name == "M5_form_profile":
-                key = f"сеты: {_hist_sets('home')} vs {_hist_sets('away')}"
-            mod_tbl.append(row(_clip(ru, colm), left, _clip(key, col1 + col2 + 1)))
-        lines.append("<code>" + "\n".join(_html_escape(x) for x in mod_tbl) + "</code>")
+            mod_parts.append(f"{ru}={_side_ru(m.side)}/{int(m.strength or 0)}")
+        if mod_parts:
+            lines.append("")
+            lines.append("<b>Модули</b>: " + _html_escape(" | ".join(mod_parts)))
+
+        # Per-module "key numbers" (no tables, but explicit metrics like rating5=..).
+        def _kv_line(label: str, left: str, right: str, diff: Optional[float], *, is_rating: bool = False) -> str:
+            if diff is None:
+                d = "—"
+                w = "—"
+            else:
+                if is_rating:
+                    d = f"{int(round(diff)):+d}"
+                else:
+                    d = f"{diff:+.0f}пп"
+                w = _win_of(diff)
+            return f"- {label}: {left} vs {right} | Δ={d} | выше={w}"
+
+        lines.append("")
+        lines.append("<b>Модули (ключевые)</b>")
+        # M1: rating5
+        lines.append(_kv_line("M1 дом (rating5)", str(r5h if r5h is not None else "—"), str(r5a if r5a is not None else "—"), float(dr5) if dr5 is not None else None, is_rating=True))
+        # M2: SSW12 + BPSR12 (if available)
+        _m2 = [
+            _metric_triplet("SSW12", "ssw_12"),
+            _metric_triplet("BPSR12", "bpsr_12"),
+        ]
+        for lab, a, b, diff in _m2:
+            lines.append(_kv_line(f"M2 под ({lab})", str(a), str(b), diff))
+        # M3: RPR12 + BPconv12
+        _m3 = [
+            _metric_triplet("RPR12", "rpr_12"),
+            _metric_triplet("BPconv12", "bpconv_12"),
+        ]
+        for lab, a, b, diff in _m3:
+            lines.append(_kv_line(f"M3 приём ({lab})", str(a), str(b), diff))
+        # M4: BPSR12 + BPconv12 (clutch)
+        _m4 = [
+            _metric_triplet("BPSR12", "bpsr_12"),
+            _metric_triplet("BPconv12", "bpconv_12"),
+        ]
+        for lab, a, b, diff in _m4:
+            lines.append(_kv_line(f"M4 клатч ({lab})", str(a), str(b), diff))
+        # M5: set win rates
+        if (s1h is not None or s1a is not None):
+            lines.append(_kv_line("M5 форма (сет1 WR)", f"{int(round(s1h))}%" if s1h is not None else "—", f"{int(round(s1a))}%" if s1a is not None else "—", (s1h - s1a) if (s1h is not None and s1a is not None) else None))
+        if (s2h is not None or s2a is not None):
+            lines.append(_kv_line("M5 форма (сет2 WR)", f"{int(round(s2h))}%" if s2h is not None else "—", f"{int(round(s2a))}%" if s2a is not None else "—", (s2h - s2a) if (s2h is not None and s2a is not None) else None))
+        if (deh is not None or dea is not None):
+            lines.append(_kv_line("M5 форма (решающие WR)", f"{int(round(deh))}%" if deh is not None else "—", f"{int(round(dea))}%" if dea is not None else "—", (deh - dea) if (deh is not None and dea is not None) else None))
 
     return "\n".join(lines)[:3800]
 
@@ -939,7 +1025,7 @@ def _print_brief(ctx, meta: dict) -> None:
                 s3 = f"{_dec(hh)}/{_dec(ha)}"
                 set_parts.append(f"сеты lastN: 1сет={s1} 2сет={s2} решающий={s3}")
 
-            # TPW(1+2) history scores (0..100), always numeric.
+            # TPW(1+2) history scores (0..100). IMPORTANT: no "fake 50" fallbacks.
             tpw12 = (hist.get("tpw12_scores") or {}) if isinstance(hist, dict) else {}
             if isinstance(tpw12, dict):
                 h5 = (tpw12.get("home") or {}).get("last5")
@@ -947,27 +1033,39 @@ def _print_brief(ctx, meta: dict) -> None:
                 h3 = (tpw12.get("home") or {}).get("last3")
                 a3 = (tpw12.get("away") or {}).get("last3")
 
-                def _g(sc: dict, k: str, d: float) -> float:
+                def _g(sc: dict, k: str) -> Optional[float]:
                     if not isinstance(sc, dict):
-                        return float(d)
+                        return None
                     v = sc.get(k)
-                    return float(v) if isinstance(v, (int, float)) else float(d)
+                    return float(v) if isinstance(v, (int, float)) else None
+
+                def _fmt(v: Optional[float]) -> str:
+                    return f"{v:.0f}" if isinstance(v, (int, float)) else "—"
 
                 if isinstance(h5, dict) and isinstance(a5, dict):
-                    tpw12_parts.append(
-                        "история TPW(1+2): "
-                        f"rating5={_g(h5,'rating',50):.0f}/{_g(a5,'rating',50):.0f} "
-                        f"power5={_g(h5,'power',50):.0f}/{_g(a5,'power',50):.0f} "
-                        f"form5={_g(h5,'form',50):.0f}/{_g(a5,'form',50):.0f} "
-                        f"vol5={_g(h5,'volatility',50):.0f}/{_g(a5,'volatility',50):.0f}"
-                    )
+                    r1, r2 = _g(h5, "rating"), _g(a5, "rating")
+                    p1, p2 = _g(h5, "power"), _g(a5, "power")
+                    f1, f2 = _g(h5, "form"), _g(a5, "form")
+                    v1, v2 = _g(h5, "volatility"), _g(a5, "volatility")
+                    if any(x is not None for x in (r1, r2, p1, p2, f1, f2, v1, v2)):
+                        tpw12_parts.append(
+                            "история TPW(1+2): "
+                            f"rating5={_fmt(r1)}/{_fmt(r2)} "
+                            f"power5={_fmt(p1)}/{_fmt(p2)} "
+                            f"form5={_fmt(f1)}/{_fmt(f2)} "
+                            f"vol5={_fmt(v1)}/{_fmt(v2)}"
+                        )
                 if isinstance(h3, dict) and isinstance(a3, dict):
-                    tpw12_parts.append(
-                        "история TPW(1+2): "
-                        f"rating3={_g(h3,'rating',50):.0f}/{_g(a3,'rating',50):.0f} "
-                        f"power3={_g(h3,'power',50):.0f}/{_g(a3,'power',50):.0f} "
-                        f"vol3={_g(h3,'volatility',50):.0f}/{_g(a3,'volatility',50):.0f}"
-                    )
+                    r1, r2 = _g(h3, "rating"), _g(a3, "rating")
+                    p1, p2 = _g(h3, "power"), _g(a3, "power")
+                    v1, v2 = _g(h3, "volatility"), _g(a3, "volatility")
+                    if any(x is not None for x in (r1, r2, p1, p2, v1, v2)):
+                        tpw12_parts.append(
+                            "история TPW(1+2): "
+                            f"rating3={_fmt(r1)}/{_fmt(r2)} "
+                            f"power3={_fmt(p1)}/{_fmt(p2)} "
+                            f"vol3={_fmt(v1)}/{_fmt(v2)}"
+                        )
     except Exception:
         pass
     q_str = (" | q: " + " ".join(q_parts)) if q_parts else ""
@@ -1323,15 +1421,19 @@ def _print_brief(ctx, meta: dict) -> None:
             sc5, sc3 = a5, a3
         if not isinstance(sc5, dict):
             return "TPW(1+2) история: NA"
-        def g(sc: dict, k: str, d: float) -> float:
+        def g(sc: dict, k: str) -> Optional[float]:
             v = sc.get(k)
-            return float(v) if isinstance(v, (int, float)) else float(d)
-        r5 = g(sc5, "rating", 50.0)
-        p5 = g(sc5, "power", 50.0)
-        f5 = g(sc5, "form", 50.0)
-        v5 = g(sc5, "volatility", 50.0)
-        r3 = g(sc3, "rating", 50.0) if isinstance(sc3, dict) else 50.0
-        return f"TPW(1+2): rating3={r3:.0f} rating5={r5:.0f} power5={p5:.0f} form5={f5:.0f} vol5={v5:.0f}"
+            return float(v) if isinstance(v, (int, float)) else None
+        r5 = g(sc5, "rating")
+        p5 = g(sc5, "power")
+        f5 = g(sc5, "form")
+        v5 = g(sc5, "volatility")
+        r3 = g(sc3, "rating") if isinstance(sc3, dict) else None
+        if all(x is None for x in (r3, r5, p5, f5, v5)):
+            return "TPW(1+2): NA"
+        def fmt(x: Optional[float]) -> str:
+            return f"{x:.0f}" if isinstance(x, (int, float)) else "NA"
+        return f"TPW(1+2): rating3={fmt(r3)} rating5={fmt(r5)} power5={fmt(p5)} form5={fmt(f5)} vol5={fmt(v5)}"
     print(
         "  ИГРОК1: "
         f"сила={_p100(_sig('home','strength'))} rating3={_p100(_sig('home','form3'))} rating5={_p100(_sig('home','form5'))} "
@@ -1618,9 +1720,11 @@ def _print_history_audit(label: str, audit: dict) -> None:
     if excluded_events:
         print("  excluded_examples:")
         for ev in excluded_events:
+            dom_err = ev.get("dom_error")
+            dom_err_s = f" dom_error={dom_err}" if dom_err else ""
             print(
                 f"    - eventId={ev.get('eventId')} opponent={ev.get('opponentName')} "
-                f"tournament={ev.get('tournament')} reason={ev.get('reason')}"
+                f"tournament={ev.get('tournament')} reason={ev.get('reason')}{dom_err_s}"
             )
 
 
@@ -1629,27 +1733,66 @@ def _print_live_event(e: LiveEvent) -> None:
     print(f"  {e.home_team_name} vs {e.away_team_name}")
 
 
-async def _with_browser(headless: bool, fn):
+async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None):
     async with async_playwright() as p:
         # Sofascore is sensitive to automation fingerprints; use a more "real" context.
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-default-browser-check",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        context = await browser.new_context(
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            viewport={"width": 1440, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            ),
-        )
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+        ]
+        context = None
+        browser = None
+        if profile_dir:
+            # Persistent context keeps cookies/localStorage — important for CF/consent/age modals.
+            try:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    headless=headless,
+                    args=launch_args,
+                    locale="ru-RU",
+                    timezone_id="Europe/Moscow",
+                    viewport={"width": 1440, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                )
+            except Exception as ex:
+                # If the same profile is already used by another Chromium instance,
+                # Playwright aborts to avoid profile corruption. Create an isolated
+                # per-run profile dir instead of crashing.
+                msg = str(ex)
+                if "SingletonLock" in msg or "ProcessSingleton" in msg:
+                    alt = f"{profile_dir}.run_{os.getpid()}"
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=alt,
+                        headless=headless,
+                        args=launch_args,
+                        locale="ru-RU",
+                        timezone_id="Europe/Moscow",
+                        viewport={"width": 1440, "height": 900},
+                        user_agent=(
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/121.0.0.0 Safari/537.36"
+                        ),
+                    )
+                else:
+                    raise
+        else:
+            browser = await p.chromium.launch(headless=headless, args=launch_args)
+            context = await browser.new_context(
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                viewport={"width": 1440, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+            )
         # Hide webdriver and add a few common navigator fields.
         try:
             await context.add_init_script(
@@ -1658,17 +1801,99 @@ async def _with_browser(headless: bool, fn):
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US','en'] });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                // Prevent popups (some Sofascore widgets open other sports/pages).
+                try {
+                  window.open = () => null;
+                } catch (e) {}
                 """
             )
         except Exception:
             pass
         context.set_default_timeout(15_000)
         context.set_default_navigation_timeout(25_000)
-        page = await context.new_page()
+        # Persistent profiles may restore previous tabs; keep only one tab for our bot,
+        # otherwise Chromium can show “random” leftover pages and slow down navigation.
         try:
+            pages = list(getattr(context, "pages", []) or [])
+        except Exception:
+            pages = []
+        page = None
+        if pages:
+            page = pages[0]
+            for extra in pages[1:]:
+                try:
+                    await extra.close()
+                except Exception:
+                    pass
+        else:
+            page = await context.new_page()
+
+        # Navigation guard: close any newly-opened pages/popups and keep the main tab in tennis.
+        async def _close_page_safely(p) -> None:
+            try:
+                await p.close()
+            except Exception:
+                pass
+
+        def _on_new_page(p) -> None:
+            try:
+                if p is page:
+                    return
+            except Exception:
+                pass
+            # Close only real popups (window.open etc.). Do NOT close pages we create ourselves.
+            async def _maybe_close() -> None:
+                try:
+                    opener = await p.opener()
+                except Exception:
+                    opener = None
+                if opener is None:
+                    return
+                await _close_page_safely(p)
+
+            asyncio.create_task(_maybe_close())
+
+        try:
+            context.on("page", _on_new_page)
+        except Exception:
+            pass
+
+        try:
+            page.on("popup", lambda p: asyncio.create_task(_close_page_safely(p)))
+        except Exception:
+            pass
+
+        async def _ensure_tennis_tab() -> None:
+            try:
+                u = page.url or ""
+            except Exception:
+                u = ""
+            # Allow match pages; everything else must be tennis home.
+            if "sofascore.com" not in u:
+                await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25_000)
+                return
+            if "/tennis" not in u:
+                await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25_000)
+                return
+            # Do NOT force locale here; Sofascore can redirect based on region/headers.
+            # We accept /ru/tennis and /en-us/tennis equally as long as it stays in tennis.
+        try:
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
+            try:
+                await _ensure_tennis_tab()
+            except Exception:
+                pass
             return await fn(page)
         finally:
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            if browser is not None:
+                await browser.close()
 
 
 async def _stop_on_enter(stop_event: asyncio.Event) -> None:
@@ -1760,20 +1985,26 @@ async def _print_team_histories(page, *, event_payload: dict, history: int) -> N
             )
 
 
-async def cmd_live(limit: int, history: int, headless: bool) -> int:
+async def cmd_live(limit: int, history: int, headless: bool, *, profile_dir: Optional[str] = None) -> int:
     async def run(page):
-        match_links = await get_live_match_links(page, limit=limit)
+        # We may filter out non-live/non-BO3/non-singles after resolving event payloads,
+        # so fetch more candidates than the display limit.
+        match_links = await get_live_match_links(page, limit=max(limit * 10, 40))
         if not match_links:
             print("No match links found.")
             return 0
 
         shown = 0
+        scanned = 0
+        skipped_not_live = 0
         for link in match_links:
             event_id = parse_event_id_from_match_link(link)
             if not event_id:
                 continue
             payload = await get_event_from_match_url_via_navigation(page, match_url=link, event_id=event_id)
+            scanned += 1
             if not _is_live(payload):
+                skipped_not_live += 1
                 continue
             e = payload.get("event") or {}
             le = LiveEvent(
@@ -1790,9 +2021,13 @@ async def cmd_live(limit: int, history: int, headless: bool) -> int:
             shown += 1
             if shown >= limit:
                 break
+        if shown == 0:
+            print(
+                f"No live singles events after filtering. scanned={scanned} skipped_not_live={skipped_not_live} total_links={len(match_links)}"
+            )
         return 0
 
-    return await _with_browser(headless, run)
+    return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
 async def cmd_analyze(
@@ -1815,6 +2050,7 @@ async def cmd_analyze(
     brief: bool,
     mode: str,
     headless: bool,
+    profile_dir: Optional[str] = None,
     history_only: bool,
 ) -> int:
     event_id = parse_event_id_from_match_link(match_url)
@@ -1965,7 +2201,7 @@ async def cmd_analyze(
                     print(f"TG: send failed: {desc or res}")
         return 0
 
-    return await _with_browser(headless, run)
+    return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
 async def cmd_watch(
@@ -1989,6 +2225,7 @@ async def cmd_watch(
     brief: bool,
     mode: str,
     headless: bool,
+    profile_dir: Optional[str] = None,
     history_only: bool,
     only_1_1: bool,
 ) -> int:
@@ -2006,6 +2243,12 @@ async def cmd_watch(
         # - history-only early (before 1:1)
         # - current+history once it becomes 1:1 after 2 sets.
         done_state: dict = {}  # event_id -> set({"history","live"})
+
+        def _get_done_state(eid: int) -> set:
+            nonlocal done_state
+            if not isinstance(done_state, dict):
+                done_state = {}
+            return done_state.setdefault(eid, set())
         failures: dict = {}  # (event_id, mode) -> count
         # Per-event progress tracking (history scraping can take time).
         progress_seen: dict = {}
@@ -2052,9 +2295,7 @@ async def cmd_watch(
                     if is_1_1:
                         hb_set_1_1 += 1
 
-                    if not isinstance(done_state, dict):
-                        done_state = {}
-                    state = done_state.setdefault(event_id, set())
+                    state = _get_done_state(event_id)
                     desired_mode = None  # "history" | "live"
                     if history_only:
                         desired_mode = "history"
@@ -2185,8 +2426,7 @@ async def cmd_watch(
                     # Sofascore stats UI can lag right when set2 ends.
                     if failures[mode_key] >= 6:
                         print("ERROR: too many failures, skipping this match.")
-                        if isinstance(done_state, dict):
-                            done_state.setdefault(event_id, set()).add(mode_key[1])
+                        _get_done_state(event_id).add(mode_key[1])
                     continue
 
                 decision, decision_side = ("SKIP", "neutral")
@@ -2335,7 +2575,7 @@ async def cmd_watch(
         stop_task.cancel()
         return 0
 
-    return await _with_browser(headless, run)
+    return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
 async def cmd_tg_test(*, tg_token: str, tg_chat: str) -> int:
@@ -2406,7 +2646,398 @@ async def cmd_tg_updates(*, tg_token: str, tg_chat: str, limit: int) -> int:
     return 0
 
 
-async def cmd_probe_stats(*, limit: int, headless: bool) -> int:
+async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[str] = None) -> int:
+    """
+    Telegram bot loop:
+    - menu buttons: Analyze all live, List live, Analyze by ID
+    - one-pass analysis only (no background notifications)
+    """
+    print("TG bot: starting…", flush=True)
+    cfg = get_telegram_config(token="", chat_id="")
+    if not cfg:
+        print("TG bot: missing token/chat_id (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)", flush=True)
+        return 2
+    client = TelegramClient(token=cfg.token, chat_id=cfg.chat_id)
+    print(f"TG bot: chat_id={cfg.chat_id}", flush=True)
+    try:
+        build_ts = int(Path(__file__).stat().st_mtime)
+        build = time.strftime("%Y-%m-%d %H:%M", time.localtime(build_ts))
+    except Exception:
+        build = ""
+    session = time.strftime("%H:%M:%S")
+
+    reply_markup = {
+        "keyboard": [
+            ["Список live", "Анализ всех live"],
+            ["Анализ по ID", "Стоп текущий"],
+            ["Выключить бота"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+    pending_id: Dict[str, bool] = {}
+    pending_stop: Dict[str, bool] = {}
+    offset = None
+    stop_flag = {"stop": False}
+    active_task: Dict[str, Optional[asyncio.Task]] = {"task": None}
+    try:
+        analyze_timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "180")
+    except Exception:
+        analyze_timeout_s = 180
+
+    async def send(text: str) -> None:
+        # Optional debug prefix to detect “stale bot instance” issues.
+        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+            prefix = f"[third_set tg-bot build={build} session={session}]\n" if build else f"[third_set tg-bot session={session}]\n"
+            text = prefix + (text or "")
+        await asyncio.to_thread(client.send_text_result, text, reply_markup=reply_markup)
+
+    # IMPORTANT: the same Playwright Page cannot be navigated concurrently.
+    # TG actions can arrive while an analysis is running, so we serialize all navigation-heavy operations.
+    nav_lock = asyncio.Lock()
+
+    def _set_active_task(t: asyncio.Task) -> None:
+        active_task["task"] = t
+
+        def _done(task: asyncio.Task) -> None:
+            try:
+                if task.cancelled():
+                    print("[TG] task cancelled", flush=True)
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    print(f"[TG] task failed: {type(exc).__name__}: {exc}", flush=True)
+            except Exception:
+                pass
+            finally:
+                # Clear if it's still the current active task.
+                if active_task.get("task") is task:
+                    active_task["task"] = None
+
+        t.add_done_callback(_done)
+
+    async def _get_live_cards(page: Page) -> List[Dict[str, Any]]:
+        async with nav_lock:
+            cards = await discover_live_cards_dom(page, limit=None)
+        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+            print(f"[TG] live(dom): cards={len(cards)}", flush=True)
+        return cards
+
+    async def _list_live(page: Page) -> None:
+        cards = await _get_live_cards(page)
+        if not cards:
+            await send("Live матчей не найдено.")
+            return
+        lines: List[str] = []
+        for i, c in enumerate(cards, 1):
+            hid = c.get("id")
+            home = str(c.get("home") or "—")
+            away = str(c.get("away") or "—")
+            score = str(c.get("score") or "—")
+            lines.append(f"{i}. {home} vs {away} | счёт: {score} | id={hid}")
+            if i >= 40:
+                break
+        await send(f"Live найдено: всего={len(cards)}\n" + "\n".join(lines))
+
+    async def _analyze_event(page: Page, ev: Dict[str, Any]) -> None:
+        try:
+            if stop_flag["stop"]:
+                return
+            payload = {"event": ev}
+            e = ev
+            event_id = int(e.get("id"))
+            slug = e.get("slug")
+            custom = e.get("customId")
+            match_url = f"https://www.sofascore.com/ru/tennis/match/{slug}/{custom}" if slug and custom else f"https://www.sofascore.com/event/{event_id}"
+            history_only = not _is_set_score_1_1_after_two_sets(payload)
+            async with nav_lock:
+                ctx, mods, final_side, score, meta = await asyncio.wait_for(
+                    analyze_once(
+                        page,
+                        event_payload=payload,
+                        match_url=match_url,
+                        event_id=event_id,
+                        max_history=max_history,
+                        history_only=history_only,
+                        audit_history=False,
+                        audit_features=True,
+                    ),
+                    timeout=analyze_timeout_s,
+                )
+            meta["mode"] = "normal"
+            msg = _format_tg_message(
+                event_id=ctx.event_id,
+                match_url=ctx.url,
+                home_name=ctx.home_name,
+                away_name=ctx.away_name,
+                set2_winner=ctx.set2_winner,
+                decision="SKIP",
+                decision_side="neutral",
+                score=score,
+                meta=meta,
+                mods=mods,
+            )
+            await asyncio.to_thread(client.send_text_result, msg, reply_markup=reply_markup)
+        except asyncio.CancelledError:
+            # Let cancellations propagate so "Стоп текущий" actually stops long jobs.
+            raise
+        except SofascoreError as ex:
+            try:
+                home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
+                away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
+                eid = ev.get("id")
+            except Exception:
+                home, away, eid = "—", "—", ev.get("id")
+            await send(f"{home} vs {away}\nSofascore\neventId={eid}\nНедостаточно статистики.\n{ex}")
+        except asyncio.TimeoutError:
+            # Don't spam chat with progress noise; send a single clear error.
+            try:
+                home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
+                away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
+            except Exception:
+                home, away = "—", "—"
+            await send(f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\nТаймаут анализа ({analyze_timeout_s}s).")
+        except Exception as ex:
+            await send(f"Ошибка анализа id={ev.get('id')}: {ex}")
+
+    async def _analyze_all(page: Page) -> None:
+        cards = await _get_live_cards(page)
+        count = 0
+        total = len(cards)
+        skipped = 0
+        started = time.time()
+        print(f"[TG] analyze_all: найдено live={total}", flush=True)
+        for idx, c in enumerate(cards, 1):
+            try:
+                if stop_flag["stop"]:
+                    break
+                eid = c.get("id")
+                url = c.get("url")
+                if not isinstance(eid, int) or not isinstance(url, str) or not url:
+                    skipped += 1
+                    continue
+                async with nav_lock:
+                    payload = await get_event_from_match_url_via_navigation(page, match_url=url, event_id=int(eid))
+                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                if not is_singles_event(ev):
+                    skipped += 1
+                    continue
+                dpc = ev.get("defaultPeriodCount")
+                if isinstance(dpc, int) and dpc != 3:
+                    skipped += 1
+                    continue
+                home = ((ev.get("homeTeam") or {}).get("name")) or "—"
+                away = ((ev.get("awayTeam") or {}).get("name")) or "—"
+                print(f"[TG] analyze_all: {idx}/{total} id={eid} {home} vs {away}", flush=True)
+                await _analyze_event(page, ev)
+                count += 1
+                if count % 3 == 0:
+                    dt = int(time.time() - started)
+                    print(f"[TG] analyze_all: прогресс ok={count} skip={skipped} t={dt}s", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                skipped += 1
+                continue
+        if count == 0:
+            await send("Live матчей для анализа не найдено.")
+        else:
+            dt = int(time.time() - started)
+            await send(f"Готово. Проанализировано матчей: {count} (пропущено {skipped}), время {dt}s")
+
+    async def _analyze_ids(page: Page, ids: List[int]) -> None:
+        print(f"[TG] analyze_ids: requested={ids}", flush=True)
+        cards = await _get_live_cards(page)
+        by_id = {int(c.get("id")): c for c in cards if isinstance(c, dict) and isinstance(c.get("id"), int)}
+        total = len(ids)
+        done = 0
+        print(f"[TG] analyze_ids: start total={total}", flush=True)
+        for eid in ids:
+            if stop_flag["stop"]:
+                break
+            c = by_id.get(int(eid))
+            if not c:
+                await send(f"id={eid} не найден в live.")
+                continue
+            url = c.get("url")
+            if not isinstance(url, str) or not url:
+                await send(f"id={eid}: нет ссылки матча.")
+                continue
+            try:
+                print(f"[TG] analyze_ids: {done+1}/{total} start id={eid}", flush=True)
+                async with nav_lock:
+                    payload = await get_event_from_match_url_via_navigation(page, match_url=str(url), event_id=int(eid))
+                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                if not isinstance(ev, dict) or not ev.get("id"):
+                    await send(f"id={eid}: не удалось получить event.")
+                    continue
+                await _analyze_event(page, ev)
+                done += 1
+                print(f"[TG] analyze_ids: {done}/{total} done id={eid}", flush=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                await send(f"Ошибка анализа id={eid}: {ex}")
+
+    async def run(page: Page) -> int:
+        try:
+            await send("Бот запущен. Выбери действие в меню.")
+        except Exception as ex:
+            print(f"TG bot: failed to send start message: {ex}", flush=True)
+        # Warm up: open Sofascore tennis page once so (a) headed mode shows a real page,
+        # (b) Cloudflare/consent/age overlays can be solved interactively and persisted in profile.
+        try:
+            await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25_000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                try:
+                    print(f"[TG] warmup: title={(await page.title())!r} url={(page.url or '')!r}", flush=True)
+                except Exception:
+                    pass
+        except Exception as ex:
+            print(f"TG bot: warmup navigation failed: {ex}", flush=True)
+        print("TG bot: ready (waiting for updates)", flush=True)
+        nonlocal offset
+        # Drain backlog so we don't "replay" old button presses and instantly stop.
+        try:
+            upd0 = client.get_updates(offset=None, limit=50, timeout=0)
+            if isinstance(upd0, dict) and upd0.get("ok"):
+                items0 = upd0.get("result") or []
+                max_id = None
+                for it in items0 if isinstance(items0, list) else []:
+                    uid = it.get("update_id") if isinstance(it, dict) else None
+                    if isinstance(uid, int):
+                        max_id = uid if max_id is None else max(max_id, uid)
+                if isinstance(max_id, int):
+                    offset = max_id + 1
+                    if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                        print(f"[TG] drained backlog to offset={offset}", flush=True)
+        except Exception as ex:
+            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                print(f"[TG] drain backlog failed: {ex}", flush=True)
+        while True:
+            try:
+                upd = await asyncio.to_thread(client.get_updates, offset=offset, limit=20, timeout=0)
+                if not (isinstance(upd, dict) and upd.get("ok")):
+                    await asyncio.sleep(1.5)
+                    continue
+                res = upd.get("result") or []
+                for item in res:
+                    try:
+                        update_id = item.get("update_id")
+                        if update_id is not None:
+                            offset = int(update_id) + 1
+                        msg = item.get("message") or item.get("edited_message") or {}
+                        chat = msg.get("chat") or {}
+                        chat_id = str(chat.get("id") or "")
+                        text = (msg.get("text") or "").strip()
+                        if not text:
+                            continue
+                        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                            uname = chat.get("username") or ""
+                            print(f"[TG] msg from {chat_id} @{uname}: {text}", flush=True)
+                        if text.startswith("/start"):
+                            await send("Меню активировано.")
+                            continue
+                        if text.startswith("/analyze"):
+                            parts = text.split()
+                            ids = [int(x) for x in parts[1:] if x.isdigit()]
+                            if not ids:
+                                pending_id[chat_id] = True
+                                await send("Пришли ID матча (одно число или несколько через пробел).")
+                            else:
+                                pending_id[chat_id] = False
+                                if active_task["task"] and not active_task["task"].done():
+                                    await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
+                                else:
+                                    stop_flag["stop"] = False
+                                    await send("Запускаю анализ по ID…")
+                                    print(f"[TG] action: analyze_ids ids={ids}", flush=True)
+                                    _set_active_task(asyncio.create_task(_analyze_ids(page, ids)))
+                            continue
+                        if text == "Список live":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: list_live", flush=True)
+                            await _list_live(page)
+                            continue
+                        if text == "Анализ всех live":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: analyze_all", flush=True)
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
+                            else:
+                                stop_flag["stop"] = False
+                                await send("Запускаю анализ всех live…")
+                                _set_active_task(asyncio.create_task(_analyze_all(page)))
+                            continue
+                        if text == "Анализ по ID":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: analyze_by_id_prompt", flush=True)
+                            pending_id[chat_id] = True
+                            await send("Пришли ID матча (число).")
+                            continue
+                        if text == "Стоп текущий":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: stop_current", flush=True)
+                            stop_flag["stop"] = True
+                            t = active_task.get("task")
+                            if t and not t.done():
+                                try:
+                                    t.cancel()
+                                except Exception:
+                                    pass
+                            active_task["task"] = None
+                            await send("Остановил текущую задачу.")
+                            continue
+                        if text == "Выключить бота":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: stop_requested", flush=True)
+                            pending_stop[chat_id] = True
+                            await send("Подтверди выключение: отправь СТОП")
+                            continue
+                        if text.strip().upper() == "СТОП" and pending_stop.get(chat_id):
+                            pending_stop[chat_id] = False
+                            stop_flag["stop"] = True
+                            t = active_task.get("task")
+                            if t and not t.done():
+                                try:
+                                    t.cancel()
+                                except Exception:
+                                    pass
+                            await send("Бот выключен.")
+                            return 0
+                        if pending_stop.get(chat_id) and text.strip().upper() != "СТОП":
+                            pending_stop[chat_id] = False
+                        if pending_id.get(chat_id):
+                            ids = [int(x) for x in re.findall(r"\\d+", text)]
+                            if not ids:
+                                continue
+                            pending_id[chat_id] = False
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
+                            else:
+                                stop_flag["stop"] = False
+                                await send("Запускаю анализ по ID…")
+                                print(f"[TG] action: analyze_ids ids={ids}", flush=True)
+                                _set_active_task(asyncio.create_task(_analyze_ids(page, ids)))
+                            continue
+                    except Exception as ex:
+                        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                            print(f"[TG] handler error: {ex}", flush=True)
+                        continue
+                await asyncio.sleep(1.0)
+            except Exception as ex:
+                print(f"TG bot: loop error: {ex}", flush=True)
+                await asyncio.sleep(2.0)
+
+    return await _with_browser(headless, run, profile_dir=profile_dir)
+
+
+async def cmd_probe_stats(*, limit: int, headless: bool, profile_dir: Optional[str] = None) -> int:
     """
     Probe /api/v1/event/<id>/statistics across live tennis matches.
 
@@ -2498,10 +3129,10 @@ async def cmd_probe_stats(*, limit: int, headless: bool) -> int:
             print(f"- missing {k}: {v}/{checked}")
         return 0
 
-    return await _with_browser(headless, run)
+    return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
-async def cmd_probe_dom(*, limit: int, headless: bool) -> int:
+async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str] = None) -> int:
     """
     Probe DOM label coverage for Statistics tab across live tennis matches.
     Prints which row labels were not mapped (root cause of '—'/NA).
@@ -2553,12 +3184,18 @@ async def cmd_probe_dom(*, limit: int, headless: bool) -> int:
                 print(f"  * {lab} (x{cnt})")
         return 0
 
-    return await _with_browser(headless, run)
+    return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="third_set")
     parser.add_argument("--headed", action="store_true", help="Run with visible browser window")
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=os.getenv("THIRDSET_PROFILE_DIR") or "",
+        help="Chromium persistent profile dir (keeps cookies/localStorage). Also via $THIRDSET_PROFILE_DIR.",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_live = sub.add_parser("live", help="List matches on Sofascore tennis page")
@@ -2675,6 +3312,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_tg_u.add_argument("--tg-chat", default=os.getenv("TELEGRAM_CHAT_ID") or os.getenv("THIRDSET_TG_CHAT_ID") or "")
     p_tg_u.add_argument("--limit", type=int, default=50)
 
+    p_tg_bot = sub.add_parser("tg-bot", help="Run Telegram bot with menu buttons")
+    p_tg_bot.add_argument("--max-history", type=int, default=5)
+
     p_probe = sub.add_parser("probe-stats", help="Probe statistics availability across live tennis matches")
     p_probe.add_argument("--limit", type=int, default=15)
 
@@ -2683,9 +3323,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     headless = not args.headed
+    profile_dir = (args.profile_dir or "").strip() or None
+    # tg-bot should be максимально устойчивым: headed + persistent profile by default.
+    if args.cmd == "tg-bot":
+        if not os.getenv("THIRDSET_FORCE_HEADLESS"):
+            headless = False
+        if profile_dir is None:
+            try:
+                profile_dir = os.path.expanduser("~/.third_set_profile")
+            except Exception:
+                profile_dir = ".third_set_profile"
 
     if args.cmd == "live":
-        return asyncio.run(cmd_live(args.limit, args.history, headless=headless))
+        return asyncio.run(cmd_live(args.limit, args.history, headless=headless, profile_dir=profile_dir))
     if args.cmd == "analyze":
         return asyncio.run(
             cmd_analyze(
@@ -2707,6 +3357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 brief=args.brief,
                 mode=args.mode,
                 headless=headless,
+                profile_dir=profile_dir,
                 history_only=args.history_only,
             )
         )
@@ -2732,6 +3383,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 brief=args.brief,
                 mode=args.mode,
                 headless=headless,
+                profile_dir=profile_dir,
                 history_only=args.history_only,
                 only_1_1=args.only_1_1,
             )
@@ -2740,10 +3392,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return asyncio.run(cmd_tg_test(tg_token=args.tg_token, tg_chat=args.tg_chat))
     if args.cmd == "tg-updates":
         return asyncio.run(cmd_tg_updates(tg_token=args.tg_token, tg_chat=args.tg_chat, limit=args.limit))
+    if args.cmd == "tg-bot":
+        return asyncio.run(cmd_tg_bot(max_history=args.max_history, headless=headless, profile_dir=profile_dir))
     if args.cmd == "probe-stats":
-        return asyncio.run(cmd_probe_stats(limit=args.limit, headless=headless))
+        return asyncio.run(cmd_probe_stats(limit=args.limit, headless=headless, profile_dir=profile_dir))
     if args.cmd == "probe-dom":
-        return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless))
+        return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless, profile_dir=profile_dir))
     raise SystemExit(2)
 
 
