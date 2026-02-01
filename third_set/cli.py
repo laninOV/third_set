@@ -2694,13 +2694,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             text = prefix + (text or "")
         await asyncio.to_thread(client.send_text_result, text, reply_markup=reply_markup)
 
-    # IMPORTANT:
-    # - the same Page cannot be navigated concurrently
-    # - but we want list_live to work even while an analysis is running
-    # So we use TWO pages: one for live discovery, one for analysis work.
-    nav_lock_work = asyncio.Lock()
-    nav_lock_live = asyncio.Lock()
-    live_page: Optional[Page] = None
+    # IMPORTANT: the same Playwright Page cannot be navigated concurrently.
+    # To reduce captcha/challenge frequency we keep everything in ONE tab and serialize navigation.
+    nav_lock = asyncio.Lock()
 
     def _set_active_task(t: asyncio.Task) -> None:
         active_task["task"] = t
@@ -2722,13 +2718,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
 
         t.add_done_callback(_done)
 
-    async def _get_live_cards(_: Page) -> List[Dict[str, Any]]:
-        # Use a dedicated page for live discovery, so we don't interrupt the analysis page.
-        lp = live_page
-        if lp is None:
-            lp = page
-        async with nav_lock_live:
-            cards = await discover_live_cards_dom(lp, limit=None)
+    async def _get_live_cards(page: Page) -> List[Dict[str, Any]]:
+        async with nav_lock:
+            cards = await discover_live_cards_dom(page, limit=None)
         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
             print(f"[TG] live(dom): cards={len(cards)}", flush=True)
         return cards
@@ -2760,7 +2752,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             custom = e.get("customId")
             match_url = f"https://www.sofascore.com/ru/tennis/match/{slug}/{custom}" if slug and custom else f"https://www.sofascore.com/event/{event_id}"
             history_only = not _is_set_score_1_1_after_two_sets(payload)
-            async with nav_lock_work:
+            async with nav_lock:
                 ctx, mods, final_side, score, meta = await asyncio.wait_for(
                     analyze_once(
                         page,
@@ -2818,6 +2810,24 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         skip_reasons: dict[str, int] = {}
         started = time.time()
         print(f"[TG] analyze_all: найдено live={total}", flush=True)
+
+        # One-button UX: before analysis, send the current live list with ids (so user doesn't need to press "Список live").
+        try:
+            if cards:
+                lines: List[str] = []
+                for i, c in enumerate(cards, 1):
+                    hid = c.get("id")
+                    home = str(c.get("home") or "—")
+                    away = str(c.get("away") or "—")
+                    score = str(c.get("score") or "—")
+                    lines.append(f"{i}. {home} vs {away} | счёт: {score} | id={hid}")
+                    if i >= 30:
+                        break
+                suffix = "" if len(cards) <= 30 else f"\n…и ещё {len(cards) - 30}"
+                await send(f"Live сейчас: {len(cards)} матчей\n" + "\n".join(lines) + suffix)
+        except Exception:
+            pass
+
         for idx, c in enumerate(cards, 1):
             try:
                 if stop_flag["stop"]:
@@ -2829,7 +2839,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                     skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
                     continue
                 try:
-                    async with nav_lock_work:
+                    async with nav_lock:
                         # Avoid heavy match-page navigation just to fetch event JSON (can timeout).
                         # /event/<id> loads faster and still triggers /api/v1/event/<id>.
                         payload = await get_event_via_navigation(page, int(eid), timeout_ms=25_000)
@@ -2896,7 +2906,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 continue
             try:
                 print(f"[TG] analyze_ids: {done+1}/{total} start id={eid}", flush=True)
-                async with nav_lock_work:
+                async with nav_lock:
                     payload = await get_event_via_navigation(page, int(eid), timeout_ms=25_000)
                 ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
                 if not isinstance(ev, dict) or not ev.get("id"):
@@ -2911,12 +2921,6 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 await send(f"Ошибка анализа id={eid}: {ex}")
 
     async def run(page: Page) -> int:
-        nonlocal live_page
-        # Create the dedicated live discovery page early.
-        try:
-            live_page = await page.context.new_page()
-        except Exception:
-            live_page = None
         try:
             await send("Бот запущен. Выбери действие в меню.")
         except Exception as ex:
@@ -2929,11 +2933,6 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 await page.wait_for_load_state("networkidle", timeout=15_000)
             except Exception:
                 pass
-            if live_page is not None:
-                try:
-                    await live_page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45_000)
-                except Exception:
-                    pass
             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                 try:
                     print(f"[TG] warmup: title={(await page.title())!r} url={(page.url or '')!r}", flush=True)
@@ -3003,6 +3002,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         if text == "Список live":
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: list_live", flush=True)
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Сейчас идёт анализ. Список live уже отправляется при запуске анализа, либо нажми после окончания.")
+                                continue
                             await _list_live(page)
                             continue
                         if text == "Анализ всех live":
