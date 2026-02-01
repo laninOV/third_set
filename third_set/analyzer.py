@@ -29,6 +29,7 @@ from third_set.sofascore import (
     get_last_finished_singles_events,
     get_event_from_match_url_auto,
     get_event_from_match_url_via_navigation,
+    get_event_via_navigation,
     parse_event_id_from_match_link,
     is_singles_event,
     summarize_event_for_team,
@@ -1135,9 +1136,8 @@ async def _history_rows_for_player_audit(
                 link_s = str(link)
                 eid = parse_event_id_from_match_link(link_s)
                 if isinstance(eid, int):
-                    base = link_s.split("#", 1)[0]
                     payload = await asyncio.wait_for(
-                        get_event_from_match_url_via_navigation(page, match_url=base, event_id=int(eid)),
+                        get_event_via_navigation(page, int(eid), timeout_ms=12_000),
                         timeout=12.0,
                     )
                 else:
@@ -1164,9 +1164,8 @@ async def _history_rows_for_player_audit(
                 link_s = str(link)
                 eid = parse_event_id_from_match_link(link_s)
                 if isinstance(eid, int):
-                    base = link_s.split("#", 1)[0]
                     payload = await asyncio.wait_for(
-                        get_event_from_match_url_via_navigation(page, match_url=base, event_id=int(eid)),
+                        get_event_via_navigation(page, int(eid), timeout_ms=12_000),
                         timeout=12.0,
                     )
                 else:
