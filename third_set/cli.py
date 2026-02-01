@@ -1810,7 +1810,8 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
         except Exception:
             pass
         context.set_default_timeout(15_000)
-        context.set_default_navigation_timeout(25_000)
+        # Sofascore can be slow under CF checks; prefer fewer false timeouts.
+        context.set_default_navigation_timeout(45_000)
         # Persistent profiles may restore previous tabs; keep only one tab for our bot,
         # otherwise Chromium can show “random” leftover pages and slow down navigation.
         try:

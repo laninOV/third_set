@@ -540,7 +540,17 @@ class LiveEvent:
 
 
 async def discover_match_links(page: Page, *, limit: Optional[int] = None) -> List[str]:
-    await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25000)
+    # Avoid re-navigating on every call: repeated goto() often triggers extra CF challenges.
+    # If we're already on a Sofascore tennis page, reuse the loaded DOM.
+    try:
+        cur_url = page.url or ""
+    except Exception:
+        cur_url = ""
+    need_nav = True
+    if "sofascore.com" in cur_url and "/tennis" in cur_url:
+        need_nav = False
+    if need_nav:
+        await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
