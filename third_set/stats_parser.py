@@ -84,8 +84,10 @@ def sum_ratio_stat(
             seen = True
     if not seen:
         return None, None
-    home_ratio = Ratio(home_won, home_total) if home_total > 0 else None
-    away_ratio = Ratio(away_won, away_total) if away_total > 0 else None
+    # Keep Ratio even when total==0 so callers can distinguish "present but 0/0"
+    # from "missing entirely". Rate will still be None via Ratio.rate.
+    home_ratio = Ratio(home_won, home_total)
+    away_ratio = Ratio(away_won, away_total)
     return home_ratio, away_ratio
 
 

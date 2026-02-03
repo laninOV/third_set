@@ -1189,22 +1189,27 @@ async def _history_rows_for_player_audit(
         sf = normalize_surface(surface_filter)
     else:
         sf = None
-    # DOM parsing opens match pages; allow limited parallelism (2 by default) for speed.
+    # DOM parsing opens match pages. Extra parallel tabs increase CAPTCHA/CF challenges,
+    # so default to sequential scraping unless explicitly overridden.
     try:
-        workers = int(os.getenv("THIRDSET_HISTORY_WORKERS", "2"))
+        workers = int(os.getenv("THIRDSET_HISTORY_WORKERS", "1"))
     except Exception:
-        workers = 2
+        workers = 1
     workers = max(1, min(4, workers))
     hist_pages: List[Page] = []
     try:
-        for _ in range(workers):
-            hist_pages.append(await page.context.new_page())
+        if workers > 1:
+            for _ in range(workers):
+                hist_pages.append(await page.context.new_page())
     except Exception:
         hist_pages = []
     if not hist_pages:
         workers = 1
 
     async def one(idx: int, ev: Dict[str, Any], *, hist_page: Optional[Page]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+        # If we didn't create extra pages (workers=1), use the main page.
+        if hist_page is None:
+            hist_page = page
         eid = ev.get("id")
         if not eid:
             return idx, None, "missing_event_id", {}
@@ -1345,8 +1350,12 @@ async def _history_rows_for_player_audit(
             h, a = snap.ratio(periods=(period,), group="Service", item="Break points saved")
             if h is None or a is None:
                 return None
-            r = h.rate if summary.get("isHome") else a.rate
-            return float(r) if r is not None else None
+            r0 = h if summary.get("isHome") else a
+            # If no break points were faced (0/0), treat as 0.0 so the metric is not "missing".
+            # This matches what Sofascore prints ("0/0 (0%)") and avoids n=0 in history.
+            if r0.total <= 0:
+                return 0.0
+            return float(r0.won / r0.total)
 
         def bpconv(period: str) -> Optional[float]:
             if snap is None:
@@ -1363,7 +1372,8 @@ async def _history_rows_for_player_audit(
                 denom = bps_h.total
                 num = bpc_a
             if denom <= 0:
-                return None
+                # If there were no break points in the set, treat as 0 conversion (non-informative but present).
+                return 0.0 if num == 0 else None
             if num < 0 or num > denom:
                 return None
             return num / denom
@@ -1425,7 +1435,7 @@ async def _history_rows_for_player_audit(
 
     def _next_page(i: int) -> Optional[Page]:
         if not hist_pages:
-            return None
+            return page
         return hist_pages[i % len(hist_pages)]
 
     async def _launch_next() -> bool:
@@ -1788,75 +1798,42 @@ async def analyze_once(
     # History:
     # User wants strict recency. We collect exactly `max_history` per player and compute both last3 and last5
     # windows from that same pool (so dynamics are visible without “размывания”).
+    #
+    # IMPORTANT: running multiple tabs in parallel increases CAPTCHA/CF challenges.
+    # We scrape sequentially in the same tab by default.
     history_pool = int(max_history)
-    # History DOM scraping is the slowest step. Run both players concurrently on separate tabs
-    # so navigations/DOM work don't block each other.
-    _dbg(f"History: pool={history_pool} (parallel home+away)")
-    home_page: Optional[Page] = None
-    away_page: Optional[Page] = None
-    try:
-        home_page = await page.context.new_page()
-        away_page = await page.context.new_page()
-    except Exception:
-        home_page = None
-        away_page = None
+    _dbg(f"History: pool={history_pool} (sequential, single tab)")
 
-    async def _hist(p: Page, team_id: int, label: str):
-        return await _history_rows_for_player_audit(
-            p,
-            match_url=match_url,
-            match_event_id=event_id,
-            match_side=label,
-            team_id=team_id,
-            team_slug=(home.get("slug") if label == "home" else away.get("slug")),
-            max_history=history_pool,
-            progress_cb=progress_cb,
-            progress_label=label,
-        )
-
-    try:
-        if home_page is not None and away_page is not None:
-            (rows_home_pool, audit_home), (rows_away_pool, audit_away) = await asyncio.gather(
-                _hist(home_page, ctx.home_id, "home"),
-                _hist(away_page, ctx.away_id, "away"),
-            )
-        else:
-            _dbg(f"History: home teamId={ctx.home_id} max={history_pool}")
-            rows_home_pool, audit_home = await _history_rows_for_player_audit(
-                page,
-                match_url=match_url,
-                match_event_id=event_id,
-                match_side="home",
-                team_id=ctx.home_id,
-                team_slug=str(home.get("slug") or ""),
-                max_history=history_pool,
-                progress_cb=progress_cb,
-                progress_label="home",
-            )
-            _dbg(f"History: away teamId={ctx.away_id} max={history_pool}")
-            rows_away_pool, audit_away = await _history_rows_for_player_audit(
-                page,
-                match_url=match_url,
-                match_event_id=event_id,
-                match_side="away",
-                team_id=ctx.away_id,
-                team_slug=str(away.get("slug") or ""),
-                max_history=history_pool,
-                progress_cb=progress_cb,
-                progress_label="away",
-            )
-    finally:
-        try:
-            if home_page is not None:
-                await home_page.close()
-        except Exception:
-            pass
-        try:
-            if away_page is not None:
-                await away_page.close()
-        except Exception:
-            pass
+    _dbg(f"History: home teamId={ctx.home_id} max={history_pool}")
+    rows_home_pool, audit_home = await _history_rows_for_player_audit(
+        page,
+        match_url=match_url,
+        match_event_id=event_id,
+        match_side="home",
+        team_id=ctx.home_id,
+        team_slug=str(home.get("slug") or ""),
+        max_history=history_pool,
+        progress_cb=progress_cb,
+        progress_label="home",
+    )
+    _dbg(f"History: away teamId={ctx.away_id} max={history_pool}")
+    rows_away_pool, audit_away = await _history_rows_for_player_audit(
+        page,
+        match_url=match_url,
+        match_event_id=event_id,
+        match_side="away",
+        team_id=ctx.away_id,
+        team_slug=str(away.get("slug") or ""),
+        max_history=history_pool,
+        progress_cb=progress_cb,
+        progress_label="away",
+    )
     pool_n = min(len(rows_home_pool), len(rows_away_pool), history_pool)
+    if pool_n <= 0:
+        raise SofascoreError(
+            f"История не собрана (home={len(rows_home_pool)}/{history_pool}, away={len(rows_away_pool)}/{history_pool}). "
+            f"Обычно причина: капча/блокировка Sofascore, таймауты загрузки, либо у игроков нет завершённых одиночных матчей в профиле."
+        )
     if len(rows_home_pool) > pool_n:
         audit_home.dropped_to_match_opponent = len(rows_home_pool) - pool_n
     if len(rows_away_pool) > pool_n:

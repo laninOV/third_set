@@ -426,6 +426,8 @@ async def _collect_json_via_navigation(
     loop = asyncio.get_running_loop()
     futures: Dict[str, asyncio.Future] = {k: loop.create_future() for k in predicates.keys()}
     required = required_keys if required_keys is not None else set(predicates.keys())
+    closed = False
+    handler_tasks: set[asyncio.Task] = set()
 
     async def _resp_json_fallback(resp: Response) -> Dict[str, Any]:
         """
@@ -477,9 +479,22 @@ async def _collect_json_via_navigation(
             return
 
     def _on_response(resp: Response) -> None:
+        nonlocal closed
+        if closed:
+            return
         t = asyncio.create_task(_handle_response(resp))
+        handler_tasks.add(t)
+
+        def _done(tt: asyncio.Task) -> None:
+            handler_tasks.discard(tt)
+            try:
+                if not tt.cancelled():
+                    _ = tt.exception()
+            except Exception:
+                pass
+
         # Retrieve exception to avoid "Future exception was never retrieved".
-        t.add_done_callback(lambda tt: tt.exception() if not tt.cancelled() else None)
+        t.add_done_callback(_done)
 
     page.on("response", _on_response)
     try:
@@ -514,7 +529,20 @@ async def _collect_json_via_navigation(
                 result[k] = fut.result()
         return result
     finally:
+        closed = True
         page.remove_listener("response", _on_response)
+        # Drain/cancel handler tasks first; they might still be trying to set exceptions
+        # on futures after we already returned/cancelled.
+        try:
+            for t in list(handler_tasks):
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            if handler_tasks:
+                await asyncio.gather(*list(handler_tasks), return_exceptions=True)
+        except Exception:
+            pass
         # Prevent "Future exception was never retrieved" warnings for non-required keys.
         for fut in futures.values():
             try:
@@ -539,7 +567,32 @@ class LiveEvent:
         return f"https://www.sofascore.com/ru/tennis/match/{self.slug}/{self.custom_id}"
 
 
-async def discover_match_links(page: Page, *, limit: Optional[int] = None) -> List[str]:
+def _tab_cfg(tab: str) -> Tuple[re.Pattern, str, str]:
+    """
+    Returns:
+      - tab_rx: python regex to find the correct pill/button
+      - want_js: JS regex literal string for DOM scanning
+      - row_cond_js: JS boolean condition string to detect the 3-pill row container by parent text
+    """
+    t = (tab or "live").strip().lower()
+    if t in ("upcoming", "предстоящие", "future", "soon"):
+        tab_rx = re.compile(r"^(Предстоящие|Upcoming)\s*(\(\d+\))?\s*$", re.I)
+        want_js = r"/^(Предстоящие|Upcoming)\s*(\(\d+\))?\s*$/i"
+        row_cond = "(p.includes('сейчас') || p.includes('live')) && (p.includes('законч') || p.includes('finished'))"
+        return tab_rx, want_js, row_cond
+    if t in ("finished", "закончился", "ended"):
+        tab_rx = re.compile(r"^(Закончился|Finished)\s*(\(\d+\))?\s*$", re.I)
+        want_js = r"/^(Закончился|Finished)\s*(\(\d+\))?\s*$/i"
+        row_cond = "(p.includes('сейчас') || p.includes('live')) && (p.includes('предстоящ') || p.includes('upcoming'))"
+        return tab_rx, want_js, row_cond
+    # default: live/now
+    tab_rx = re.compile(r"^(Сейчас|Live)\s*(\(\d+\))?\s*$", re.I)
+    want_js = r"/^(Сейчас|Live)\s*(\(\d+\))?\s*$/i"
+    row_cond = "(p.includes('законч') || p.includes('finished')) && (p.includes('предстоящ') || p.includes('upcoming'))"
+    return tab_rx, want_js, row_cond
+
+
+async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: str = "live") -> List[str]:
     # Avoid re-navigating on every call: repeated goto() often triggers extra CF challenges.
     # If we're already on a Sofascore tennis page, reuse the loaded DOM.
     try:
@@ -591,13 +644,11 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None) -> Li
                 pass
     except Exception:
         pass
-    # Ensure LIVE tab is selected (RU/EN). The tab includes a count like "Сейчас (28)" / "Live (28)".
-    # IMPORTANT: We must match Sofascore UI exactly — the authoritative source is the selected tab:
-    #   button[aria-selected="true"] == "Сейчас (N)" (RU) or "Live (N)" (EN).
+    # Ensure the requested tab is selected (RU/EN). Some tabs include a count like "Сейчас (28)".
     expected_n: Optional[int] = None
     chosen_label: Optional[str] = None
     try:
-        tab_rx = re.compile(r"^(Сейчас|Live)\s*\(\d+\)\s*$", re.I)
+        tab_rx, want_js, row_cond_js = _tab_cfg(tab)
         # Prefer the already-selected LIVE tab (avoids picking unrelated "Live" buttons elsewhere).
         selected = page.locator("button[aria-selected='true']").filter(has_text=tab_rx)
         tab_to_click = None
@@ -606,30 +657,42 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None) -> Li
         else:
             # Click the LIVE tab in the 3-pill row (Сейчас / Закончился / Предстоящие).
             # There can be other "(N)" buttons on the page; filter by parent text containing the other pills.
-            tabs = page.locator("button").filter(has_text=tab_rx)
-            best = None
-            for i in range(min(await tabs.count(), 30)):
-                cand = tabs.nth(i)
-                try:
-                    if not await cand.is_visible():
+            # Sofascore often marks the active LIVE pill with a special class like "bg_status.live" (note the dot).
+            # Prefer it when present: it matches what the user sees ("Сейчас (N)").
+            try:
+                if tab.strip().lower() in ("live", "now", "сейчас"):
+                    cls_btns = page.locator("button[class*='bg_status.live']")
+                    if await cls_btns.count():
+                        cand = cls_btns.first
+                        if await cand.is_visible():
+                            tab_to_click = cand
+            except Exception:
+                tab_to_click = None
+            if tab_to_click is None:
+                tabs = page.locator("button").filter(has_text=tab_rx)
+                best = None
+                for i in range(min(await tabs.count(), 30)):
+                    cand = tabs.nth(i)
+                    try:
+                        if not await cand.is_visible():
+                            continue
+                    except Exception:
                         continue
-                except Exception:
-                    continue
-                try:
-                    parent_txt = await cand.evaluate(
-                        """(el) => (el && el.parentElement && (el.parentElement.innerText || el.parentElement.textContent) || '')"""
-                    )
-                except Exception:
-                    parent_txt = ""
-                p = (parent_txt or "").lower()
-                has_finished = ("законч" in p) or ("finished" in p)
-                has_upcoming = ("предстоящ" in p) or ("upcoming" in p)
-                if has_finished and has_upcoming:
-                    best = cand
-                    break
-                if best is None:
-                    best = cand
-            tab_to_click = best
+                    try:
+                        parent_txt = await cand.evaluate(
+                            """(el) => (el && el.parentElement && (el.parentElement.innerText || el.parentElement.textContent) || '')"""
+                        )
+                    except Exception:
+                        parent_txt = ""
+                    p = (parent_txt or "").lower()
+                    has_finished = ("законч" in p) or ("finished" in p)
+                    has_upcoming = ("предстоящ" in p) or ("upcoming" in p)
+                    if has_finished and has_upcoming:
+                        best = cand
+                        break
+                    if best is None:
+                        best = cand
+                tab_to_click = best
         if tab_to_click is not None:
             try:
                 await tab_to_click.click(timeout=2500, force=True)
@@ -688,11 +751,11 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None) -> Li
                   }}
                   function findRoot() {{
                     function findLiveBtn() {{
-                      const want = /^(Сейчас|Live)\\s*\\(\\d+\\)\\s*$/i;
+                      const want = {want_js};
                       const candidates = Array.from(document.querySelectorAll('button')).filter(b => want.test(((b.innerText||b.textContent||'').trim())));
                       for (const b of candidates) {{
                         const p = (b.parentElement && (b.parentElement.innerText || b.parentElement.textContent) || '').toLowerCase();
-                        if ((p.includes('законч') || p.includes('finished')) && (p.includes('предстоящ') || p.includes('upcoming'))) {{
+                        if ({row_cond_js}) {{
                           return b;
                         }}
                       }}
@@ -871,7 +934,7 @@ async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) ->
 
     This is the only method that can be made to exactly match what the user sees in the UI.
     """
-    links = await discover_match_links(page, limit=limit)
+    links = await discover_match_links(page, limit=limit, tab="live")
     if not links:
         return []
     allowed_ids: List[int] = []
@@ -940,7 +1003,99 @@ async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) ->
               const res = [];
               for (const id of (allowedIds || [])) {
                 const sel = `a[href*=\"/tennis/match/\"][href*=\"#id:${id}\"]`;
-                const a = Array.from(root.querySelectorAll(sel)).find(isVisible) || null;
+                let a = Array.from(root.querySelectorAll(sel)).find(isVisible) || null;
+                // Fallback: root detection can miss the virtualized list on some layouts;
+                // try the whole document before giving up.
+                if (!a) {
+                  a = Array.from(document.querySelectorAll(sel)).find(isVisible) || null;
+                }
+                if (!a) continue;
+                const href = a.getAttribute('href') || '';
+                const urlAbs = a.href || (location.origin + href);
+                const url = urlAbs.split('#')[0];
+                let home = null;
+                let away = null;
+                const rawLines = (a.innerText || a.textContent || '').split('\\n').map(norm).filter(Boolean);
+                const nameLines = rawLines
+                  .filter(t => /[A-Za-zА-Яа-яЁё]/.test(t))
+                  .filter(t => !/^\\d{1,2}:\\d{2}$/.test(t))
+                  .filter(t => !/^(ПВ|LIVE|Finished|Закончил(ся|ась)?|Сейчас|Now)$/i.test(t))
+                  .filter(t => !/^\\d+(-\\d+)*$/.test(t))
+                  .filter(t => !/(сет|set)$/i.test(t));
+                if (nameLines.length >= 2) {
+                  home = nameLines[0];
+                  away = nameLines[1];
+                }
+                const scoreRoot =
+                  a.querySelector('div.d_flex.flex-d_column.ai_flex-end') ||
+                  a.querySelector('div[class*=\"ai_flex-end\"][class*=\"flex-d_column\"]') ||
+                  null;
+                const score = scoreRoot ? norm(scoreRoot.textContent) : null;
+                if (!url) continue;
+                res.push({ id, url, home, away, score });
+              }
+              return res;
+            }
+            """,
+            allowed_ids,
+        )
+    except Exception:
+        cards = []
+    if not isinstance(cards, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        eid = c.get("id")
+        if not isinstance(eid, int) or eid not in allowed_set:
+            continue
+        out.append(c)
+    return out
+
+
+async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    DOM-only upcoming discovery:
+    - opens Sofascore tennis page
+    - clicks the "Предстоящие"/"Upcoming" pill
+    - extracts: eventId (from #id:), match url, home/away names, and a raw score/time text.
+    """
+    links = await discover_match_links(page, limit=limit, tab="upcoming")
+    if not links:
+        return []
+    allowed_ids: List[int] = []
+    allowed_set: set = set()
+    for u in links:
+        eid = parse_event_id_from_match_link(str(u))
+        if isinstance(eid, int):
+            allowed_ids.append(eid)
+            allowed_set.add(eid)
+
+    try:
+        # Reuse the same extractor as live cards: it looks for anchors with "#id:<eventId>" and pulls the surrounding text.
+        cards = await page.evaluate(
+            """
+            (allowedIds) => {
+              function norm(s){
+                return (s || '')
+                  .replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g, ' ')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
+              }
+              function isVisible(el) {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = el.getClientRects();
+                if (!r || r.length === 0) return false;
+                const box = r[0];
+                return (box.width > 1 && box.height > 1);
+              }
+              const res = [];
+              for (const id of (allowedIds || [])) {
+                const sel = `a[href*=\"/tennis/match/\"][href*=\"#id:${id}\"]`;
+                const a = Array.from(document.querySelectorAll(sel)).find(isVisible) || null;
                 if (!a) {
                   res.push({ id, url: null, home: null, away: null, score: null });
                   continue;

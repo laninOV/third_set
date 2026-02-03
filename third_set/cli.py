@@ -21,6 +21,7 @@ from third_set.sofascore import (
     SofascoreError,
     discover_match_links,
     discover_live_cards_dom,
+    discover_upcoming_cards_dom,
     get_live_events,
     get_live_events_via_navigation,
     get_live_match_links,
@@ -217,8 +218,10 @@ def _format_tg_message(
         leader = "нейтр"
         if isinstance(p1, int) and isinstance(p2, int):
             leader = "1" if p1 > p2 else "2" if p2 > p1 else "нейтр"
-        if isinstance(p1, int) and isinstance(p2, int) and isinstance(conf, int):
-            lines.append(f"<b>Прогноз</b>: 1={p1}%  2={p2}%  | уверенность={conf}%  | лидер={leader}")
+        # We'll add ✅ for agreement only if Sofascore vote agrees (computed later).
+        forecast_p1 = p1
+        forecast_p2 = p2
+        forecast_leader = leader
 
         diffs = summ.get("idx_diffs") if isinstance(summ.get("idx_diffs"), dict) else {}
         contrib: List[tuple] = []
@@ -264,6 +267,9 @@ def _format_tg_message(
             line += f" | сильные: 1={strong_h} 2={strong_a}"
         lines.append(line)
 
+    sofascore_leader = None
+    sofascore_p1i = None
+    sofascore_p2i = None
     try:
         sv = meta.get("sofascore_votes") if isinstance(meta, dict) else None
         vote = (sv.get("vote") or {}) if isinstance(sv, dict) else None
@@ -275,7 +281,51 @@ def _format_tg_message(
             if tot > 0 and isinstance(v1, int) and isinstance(v2, int):
                 p1 = (v1 / tot) * 100.0
                 p2 = (v2 / tot) * 100.0
-                lines.append(f"<b>Sofascore голосование</b>: 1={p1:.0f}% 2={p2:.0f}% (всего {tot})")
+                # IMPORTANT: decide the checkmark based on what we actually print (rounded %),
+                # otherwise 49.6/50.4 becomes "50/50" but still gets a ✅.
+                p1i = int(round(p1))
+                p2i = int(round(p2))
+                lead = "1" if p1i > p2i else "2" if p2i > p1i else "нейтр"
+                sofascore_leader = lead if lead in ("1", "2") else None
+                sofascore_p1i = p1i
+                sofascore_p2i = p2i
+                # Print later (after we compute agreement mark).
+    except Exception:
+        pass
+
+    # Agreement mark: only when BOTH forecast and Sofascore point to the same side.
+    consensus = None
+    try:
+        if isinstance(locals().get("forecast_leader"), str) and forecast_leader in ("1", "2") and sofascore_leader in ("1", "2"):
+            if forecast_leader == sofascore_leader:
+                consensus = forecast_leader
+    except Exception:
+        consensus = None
+
+    # Now print Forecast and Sofascore lines with agreement-only ✅.
+    try:
+        if isinstance(locals().get("forecast_p1"), int) and isinstance(locals().get("forecast_p2"), int) and isinstance(conf, int):
+            m1 = "✅" if consensus == "1" else ""
+            m2 = "✅" if consensus == "2" else ""
+            lines.append(
+                f"<b>Прогноз</b>: 1={forecast_p1}%{m1}  2={forecast_p2}%{m2}  | уверенность={conf}%  | лидер={forecast_leader}"
+            )
+    except Exception:
+        pass
+    try:
+        if isinstance(sofascore_p1i, int) and isinstance(sofascore_p2i, int):
+            m1 = "✅" if consensus == "1" else ""
+            m2 = "✅" if consensus == "2" else ""
+            tot = None
+            sv = meta.get("sofascore_votes") if isinstance(meta, dict) else None
+            vote = (sv.get("vote") or {}) if isinstance(sv, dict) else None
+            if isinstance(vote, dict):
+                v1 = vote.get("vote1")
+                v2 = vote.get("vote2")
+                vx = vote.get("voteX")
+                tot = sum(int(x) for x in (v1, v2, vx) if isinstance(x, int))
+            if isinstance(tot, int) and tot > 0:
+                lines.append(f"<b>Sofascore голосование</b>: 1={sofascore_p1i}%{m1} 2={sofascore_p2i}%{m2} (всего {tot})")
     except Exception:
         pass
 
@@ -387,14 +437,14 @@ def _format_tg_message(
         def _hist_metric(side: str, key: str) -> str:
             src = cal.get(side) if isinstance(cal, dict) else None
             if not isinstance(src, dict):
-                return "—[n=0]"
+                return "нет данных"
             ms = src.get(key)
             if not isinstance(ms, dict):
-                return "—[n=0]"
+                return "нет данных"
             m = ms.get("mean")
             n = ms.get("n")
             if not isinstance(m, (int, float)) or not isinstance(n, int) or n <= 0:
-                return "—[n=0]"
+                return "нет данных"
             return f"{float(m)*100:.0f}%[n={n}]"
 
         def _hist_sets(side: str) -> str:
@@ -441,7 +491,7 @@ def _format_tg_message(
             a = _hist_metric("home", key)
             b = _hist_metric("away", key)
             # Try to compute diff in percentage points if numeric.
-            # _hist_metric returns like "57%[n=10]" or "—[n=0]"
+            # _hist_metric returns like "57%[n=10]" or "нет данных"
             def _to_pct(s: str) -> Optional[float]:
                 m = re.search(r"(\d+(?:\.\d+)?)%", s)
                 return float(m.group(1)) if m else None
@@ -541,7 +591,16 @@ def _format_tg_message(
             lines.append("<b>Модули</b>: " + _html_escape(" | ".join(mod_parts)))
 
         # Per-module "key numbers" (no tables, but explicit metrics like rating5=..).
-        def _kv_line(label: str, left: str, right: str, diff: Optional[float], *, is_rating: bool = False) -> str:
+        def _kv_line(
+            label: str,
+            left: str,
+            right: str,
+            diff: Optional[float],
+            *,
+            is_rating: bool = False,
+            consensus_side: Optional[str] = None,
+            mark_if_consensus: bool = False,
+        ) -> str:
             if diff is None:
                 d = "—"
                 w = "—"
@@ -551,12 +610,61 @@ def _format_tg_message(
                 else:
                     d = f"{diff:+.0f}пп"
                 w = _win_of(diff)
-            return f"- {label}: {left} vs {right} | Δ={d} | выше={w}"
+
+            # Decide winner/✅ based on the numbers that are shown to the user (left/right),
+            # not on hidden thresholds like n>=3.
+            def _first_number(s: str) -> Optional[float]:
+                try:
+                    m = re.search(r"(-?\\d+(?:[\\.,]\\d+)?)", s)
+                    if not m:
+                        return None
+                    return float(m.group(1).replace(",", "."))
+                except Exception:
+                    return None
+
+            ln = _first_number(left)
+            rn = _first_number(right)
+            if ln is not None and rn is not None:
+                if ln > rn:
+                    w = "1"
+                elif rn > ln:
+                    w = "2"
+                else:
+                    w = "нейтр"
+            allow_mark = w in ("1", "2")
+
+            # Put ✅ right next to the winning number (what you asked for: "43 vs 45✅"),
+            # and keep "выше=1/2" as the explicit label.
+            left_out = left
+            right_out = right
+            if allow_mark and (not mark_if_consensus):
+                if w == "1":
+                    left_out = f"{left_out}✅"
+                elif w == "2":
+                    right_out = f"{right_out}✅"
+            elif allow_mark and mark_if_consensus and consensus_side in ("1", "2"):
+                if w == consensus_side:
+                    if w == "1":
+                        left_out = f"{left_out}✅"
+                    elif w == "2":
+                        right_out = f"{right_out}✅"
+
+            return f"- {label}: {left_out} vs {right_out} | Δ={d} | выше={w}"
 
         lines.append("")
         lines.append("<b>Модули (ключевые)</b>")
         # M1: rating5
-        lines.append(_kv_line("M1 дом (rating5)", str(r5h if r5h is not None else "—"), str(r5a if r5a is not None else "—"), float(dr5) if dr5 is not None else None, is_rating=True))
+        lines.append(
+            _kv_line(
+                "M1 дом (rating5)",
+                str(r5h if r5h is not None else "—"),
+                str(r5a if r5a is not None else "—"),
+                float(dr5) if dr5 is not None else None,
+                is_rating=True,
+                consensus_side=consensus,
+                mark_if_consensus=True,
+            )
+        )
         # M2: SSW12 + BPSR12 (if available)
         _m2 = [
             _metric_triplet("SSW12", "ssw_12"),
@@ -585,6 +693,11 @@ def _format_tg_message(
             lines.append(_kv_line("M5 форма (сет2 WR)", f"{int(round(s2h))}%" if s2h is not None else "—", f"{int(round(s2a))}%" if s2a is not None else "—", (s2h - s2a) if (s2h is not None and s2a is not None) else None))
         if (deh is not None or dea is not None):
             lines.append(_kv_line("M5 форма (решающие WR)", f"{int(round(deh))}%" if deh is not None else "—", f"{int(round(dea))}%" if dea is not None else "—", (deh - dea) if (deh is not None and dea is not None) else None))
+
+        # Explain why "нет данных" appears.
+        if any(x == "нет данных" for x in (str(_hist_metric("home", "ssw_12")), str(_hist_metric("away", "ssw_12")), str(_hist_metric("home", "rpr_12")), str(_hist_metric("away", "rpr_12")), str(_hist_metric("home", "bpsr_12")), str(_hist_metric("away", "bpsr_12")), str(_hist_metric("home", "bpconv_12")), str(_hist_metric("away", "bpconv_12")))):
+            lines.append("")
+            lines.append("<i>Примечание</i>: «нет данных» = Sofascore не показал эту метрику на вкладке «Статистика» в последних матчах игрока.")
 
     return "\n".join(lines)[:3800]
 
@@ -1810,8 +1923,8 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
         except Exception:
             pass
         context.set_default_timeout(15_000)
-        # Sofascore can be slow under CF checks; prefer fewer false timeouts.
-        context.set_default_navigation_timeout(45_000)
+        # Sofascore can be slow under CF checks / occasional 503; prefer fewer false timeouts.
+        context.set_default_navigation_timeout(60_000)
         # Persistent profiles may restore previous tabs; keep only one tab for our bot,
         # otherwise Chromium can show “random” leftover pages and slow down navigation.
         try:
@@ -2670,6 +2783,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     reply_markup = {
         "keyboard": [
             ["Список live", "Анализ всех live"],
+            ["Список upcoming", "Анализ upcoming"],
             ["Анализ по ID", "Стоп текущий"],
             ["Выключить бота"],
         ],
@@ -2678,6 +2792,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     }
 
     pending_id: Dict[str, bool] = {}
+    pending_upcoming: Dict[str, bool] = {}
     pending_stop: Dict[str, bool] = {}
     offset = None
     stop_flag = {"stop": False}
@@ -2697,6 +2812,27 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     # IMPORTANT: the same Playwright Page cannot be navigated concurrently.
     # To reduce captcha/challenge frequency we keep everything in ONE tab and serialize navigation.
     nav_lock = asyncio.Lock()
+
+    async def progress_cb(info: Dict[str, Any]) -> None:
+        """
+        Progress callback from analyzer history scraping.
+        Prints to terminal only (no TG spam).
+        """
+        try:
+            label = str(info.get("label") or "")
+            have = int(info.get("have") or 0)
+            target = int(info.get("target") or 0)
+            scanned = int(info.get("scanned") or 0)
+            eid = info.get("eventId")
+            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes") or os.getenv("THIRDSET_PROGRESS") in (
+                "1",
+                "true",
+                "yes",
+            ):
+                extra = f" eventId={eid}" if isinstance(eid, int) else ""
+                print(f"[TG] history {label}: {have}/{target} scanned={scanned}{extra}", flush=True)
+        except Exception:
+            return
 
     def _set_active_task(t: asyncio.Task) -> None:
         active_task["task"] = t
@@ -2725,6 +2861,13 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             print(f"[TG] live(dom): cards={len(cards)}", flush=True)
         return cards
 
+    async def _get_upcoming_cards(page: Page) -> List[Dict[str, Any]]:
+        async with nav_lock:
+            cards = await discover_upcoming_cards_dom(page, limit=None)
+        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+            print(f"[TG] upcoming(dom): cards={len(cards)}", flush=True)
+        return cards
+
     async def _list_live(page: Page) -> None:
         cards = await _get_live_cards(page)
         if not cards:
@@ -2740,6 +2883,109 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             if i >= 40:
                 break
         await send(f"Live найдено: всего={len(cards)}\n" + "\n".join(lines))
+
+    async def _list_upcoming(page: Page, *, hours: Optional[float] = None) -> None:
+        cards = await _get_upcoming_cards(page)
+        if not cards:
+            await send("Upcoming матчей не найдено.")
+            return
+        now = time.time()
+        horizon = now + (float(hours) * 3600.0) if isinstance(hours, (int, float)) and hours > 0 else None
+        lines: List[str] = []
+        kept = 0
+        for c in cards:
+            eid = c.get("id")
+            if not isinstance(eid, int):
+                continue
+            st = None
+            ev: dict = {}
+            try:
+                async with nav_lock:
+                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=20_000)
+                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                st = ev.get("startTimestamp")
+            except Exception:
+                st = None
+                ev = {}
+            if isinstance(st, int) and horizon is not None and st > horizon:
+                continue
+            # Prefer authoritative names from the event payload (DOM cards can contain labels like "Отменено").
+            status = (ev.get("status") or {}).get("type") if isinstance(ev, dict) else None
+            if str(status or "").lower() in ("canceled", "cancelled", "postponed"):
+                continue
+            home = str(((ev.get("homeTeam") or {}).get("name")) or c.get("home") or "—")
+            away = str(((ev.get("awayTeam") or {}).get("name")) or c.get("away") or "—")
+            score = str(c.get("score") or "—")
+            lines.append(f"{kept+1}. {home} vs {away} | время/счёт: {score} | id={eid}")
+            kept += 1
+            if kept >= 40:
+                break
+        header = f"Upcoming сейчас: всего={len(cards)}"
+        if horizon is not None:
+            header += f", окно={hours:g}ч"
+        await send(header + "\n" + ("\n".join(lines) if lines else "Нет матчей в выбранном окне."))
+
+    async def _analyze_upcoming(page: Page, *, hours: float) -> None:
+        cards = await _get_upcoming_cards(page)
+        now = time.time()
+        horizon = now + max(0.25, float(hours)) * 3600.0
+        # Filter by startTimestamp; also keep BO3 singles only.
+        filtered: List[Dict[str, Any]] = []
+        for c in cards:
+            eid = c.get("id")
+            if not isinstance(eid, int):
+                continue
+            try:
+                async with nav_lock:
+                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=20_000)
+                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+            except Exception:
+                continue
+            st = ev.get("startTimestamp")
+            if isinstance(st, int) and st > horizon:
+                continue
+            if not is_singles_event(ev):
+                continue
+            dpc = ev.get("defaultPeriodCount")
+            if isinstance(dpc, int) and dpc != 3:
+                continue
+            # Only not-started matches; ignore cancelled/finished/live that leaked into the tab.
+            status = str(((ev.get("status") or {}).get("type")) or "").lower()
+            if status in ("canceled", "cancelled", "postponed"):
+                continue
+            if status and status not in ("notstarted", "not_started", "scheduled"):
+                continue
+            filtered.append({"event": ev, "card": c})
+            if len(filtered) >= 12:
+                break
+
+        if not filtered:
+            await send(f"Нет подходящих upcoming матчей в окне {hours:g}ч.")
+            return
+        await send(f"Запускаю анализ upcoming (окно {hours:g}ч)… матчей={len(filtered)}")
+
+        ok = 0
+        skipped = 0
+        started = time.time()
+        for i, item in enumerate(filtered, 1):
+            if stop_flag["stop"]:
+                break
+            ev = item.get("event") or {}
+            c = item.get("card") or {}
+            eid = ev.get("id") or c.get("id")
+            home = ((ev.get("homeTeam") or {}).get("name")) or str(c.get("home") or "—")
+            away = ((ev.get("awayTeam") or {}).get("name")) or str(c.get("away") or "—")
+            print(f"[TG] analyze_upcoming: {i}/{len(filtered)} id={eid} {home} vs {away}", flush=True)
+            try:
+                await _analyze_event(page, ev)  # history_only будет выбран автоматически (сеты не 1:1)
+                ok += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                skipped += 1
+                continue
+        dt = int(time.time() - started)
+        await send(f"Готово upcoming: ok={ok} skip={skipped} t={dt}s")
 
     async def _analyze_event(page: Page, ev: Dict[str, Any]) -> None:
         try:
@@ -2761,6 +3007,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         event_id=event_id,
                         max_history=max_history,
                         history_only=history_only,
+                        progress_cb=progress_cb,
                         audit_history=False,
                         audit_features=True,
                     ),
@@ -3007,6 +3254,15 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 continue
                             await _list_live(page)
                             continue
+                        if text == "Список upcoming":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: list_upcoming", flush=True)
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Сейчас идёт анализ. Нажми после окончания.")
+                                continue
+                            # default: show everything in the tab
+                            await _list_upcoming(page, hours=None)
+                            continue
                         if text == "Анализ всех live":
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: analyze_all", flush=True)
@@ -3016,6 +3272,12 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 stop_flag["stop"] = False
                                 await send("Запускаю анализ всех live…")
                                 _set_active_task(asyncio.create_task(_analyze_all(page)))
+                            continue
+                        if text == "Анализ upcoming":
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: analyze_upcoming_prompt", flush=True)
+                            pending_upcoming[chat_id] = True
+                            await send("Пришли окно в часах (например: 1 или 2). Я возьму upcoming матчи, которые начнутся в этом окне, и посчитаю по истории.")
                             continue
                         if text == "Анализ по ID":
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
@@ -3067,6 +3329,26 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 await send("Запускаю анализ по ID…")
                                 print(f"[TG] action: analyze_ids ids={ids}", flush=True)
                                 _set_active_task(asyncio.create_task(_analyze_ids(page, ids)))
+                            continue
+                        if pending_upcoming.get(chat_id):
+                            hrs = None
+                            try:
+                                m = re.findall(r"\\d+(?:[\\.,]\\d+)?", text)
+                                if m:
+                                    hrs = float(m[0].replace(",", "."))
+                            except Exception:
+                                hrs = None
+                            pending_upcoming[chat_id] = False
+                            if hrs is None or hrs <= 0:
+                                await send("Не понял окно. Пришли число часов, например 1 или 2.")
+                                continue
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
+                                continue
+                            stop_flag["stop"] = False
+                            await send("Запускаю анализ upcoming…")
+                            print(f"[TG] action: analyze_upcoming hours={hrs}", flush=True)
+                            _set_active_task(asyncio.create_task(_analyze_upcoming(page, hours=float(hrs))))
                             continue
                     except Exception as ex:
                         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):

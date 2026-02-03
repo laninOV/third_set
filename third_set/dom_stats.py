@@ -21,6 +21,30 @@ def _dbg(msg: str) -> None:
     if os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes"):
         print(f"[dom] {msg}", flush=True)
 
+async def _is_varnish_503(page: Page) -> bool:
+    """
+    Sofascore sometimes returns a Varnish error page:
+      "Error 503 backend read error"
+    This is transient and should be retried instead of treated as "no stats".
+    """
+    try:
+        t = (await page.title()) or ""
+        if "503" in t and "backend" in t.lower():
+            return True
+    except Exception:
+        pass
+    try:
+        # Fast text checks; avoid heavy DOM extraction.
+        loc = page.locator("text=/Error\\s*503/i")
+        if await loc.count():
+            return True
+        loc2 = page.locator("text=/backend read error/i")
+        if await loc2.count():
+            return True
+    except Exception:
+        pass
+    return False
+
 
 _GROUP_MAP = {
     # RU
@@ -635,11 +659,40 @@ async def extract_statistics_dom(
 
     if not on_same_match or not has_event_fragment:
         _dbg(f"goto {target}")
-        await page.goto(target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass
+        last_err: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                await page.goto(target, wait_until="domcontentloaded", timeout=max(_NAV_TIMEOUT_MS, 45_000))
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
+                if await _is_varnish_503(page):
+                    # transient backend cache error; wait and retry
+                    wait_ms = 800 * (attempt + 1)
+                    _dbg(f"varnish_503: retry in {wait_ms}ms (attempt {attempt+1}/4)")
+                    await page.wait_for_timeout(wait_ms)
+                    continue
+                last_err = None
+                break
+            except Exception as ex:
+                last_err = ex
+                # short backoff and retry
+                await page.wait_for_timeout(700 * (attempt + 1))
+                continue
+        if last_err is not None:
+            raise last_err
+    else:
+        # Even if we think we're on the same match, Sofascore might have returned a 503 page.
+        if await _is_varnish_503(page):
+            _dbg("varnish_503 on same match; reloading")
+            await page.goto(target, wait_until="domcontentloaded", timeout=max(_NAV_TIMEOUT_MS, 45_000))
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            if await _is_varnish_503(page):
+                raise DomStatsError("Sofascore 503 backend read error (Varnish)")
 
     if await _is_cloudflare_block(page):
         raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
