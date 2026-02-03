@@ -428,6 +428,18 @@ async def _collect_json_via_navigation(
     required = required_keys if required_keys is not None else set(predicates.keys())
     closed = False
     handler_tasks: set[asyncio.Task] = set()
+    # Ensure no "Future exception was never retrieved" even if a future completes late.
+    def _consume_future(fut: asyncio.Future) -> None:
+        try:
+            if not fut.cancelled():
+                _ = fut.exception()
+        except Exception:
+            pass
+    for fut in futures.values():
+        try:
+            fut.add_done_callback(_consume_future)
+        except Exception:
+            pass
 
     async def _resp_json_fallback(resp: Response) -> Dict[str, Any]:
         """
@@ -543,6 +555,13 @@ async def _collect_json_via_navigation(
                 await asyncio.gather(*list(handler_tasks), return_exceptions=True)
         except Exception:
             pass
+        # Cancel pending futures to avoid late exceptions.
+        for fut in futures.values():
+            try:
+                if not fut.done():
+                    fut.cancel()
+            except Exception:
+                pass
         # Prevent "Future exception was never retrieved" warnings for non-required keys.
         for fut in futures.values():
             try:

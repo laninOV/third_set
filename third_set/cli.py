@@ -3457,7 +3457,7 @@ async def cmd_probe_stats(*, limit: int, headless: bool, profile_dir: Optional[s
     return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
-async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str] = None) -> int:
+async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str] = None, seen: bool = False) -> int:
     """
     Probe DOM label coverage for Statistics tab across live tennis matches.
     Prints which row labels were not mapped (root cause of '—'/NA).
@@ -3469,7 +3469,8 @@ async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str
             print("No live tennis matches found.")
             return 0
 
-        agg: dict = {}  # group -> label -> count
+        agg: dict = {}  # group -> label -> count (unmapped)
+        agg_seen: dict = {}  # group -> label -> count (seen)
         for link in links:
             event_id = parse_event_id_from_match_link(link)
             if not event_id:
@@ -3482,6 +3483,7 @@ async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str
                 )
                 meta = stats.get("_meta") if isinstance(stats, dict) else None
                 unm = (meta or {}).get("unmapped") if isinstance(meta, dict) else None
+                seen_map = (meta or {}).get("seen") if isinstance(meta, dict) else None
                 if not isinstance(unm, dict):
                     continue
                 for per, groups in unm.items():
@@ -3494,6 +3496,17 @@ async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str
                             key = f"{per}:{g}"
                             agg.setdefault(key, {})
                             agg[key][str(lab)] = int(agg[key].get(str(lab), 0)) + 1
+                if seen and isinstance(seen_map, dict):
+                    for per, groups in seen_map.items():
+                        if not isinstance(groups, dict):
+                            continue
+                        for g, labels in groups.items():
+                            if not isinstance(labels, list):
+                                continue
+                            for lab in labels:
+                                key = f"{per}:{g}"
+                                agg_seen.setdefault(key, {})
+                                agg_seen[key][str(lab)] = int(agg_seen[key].get(str(lab), 0)) + 1
             except Exception:
                 continue
 
@@ -3507,6 +3520,13 @@ async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str
             items = sorted(agg[key].items(), key=lambda kv: kv[1], reverse=True)
             for lab, cnt in items[:25]:
                 print(f"  * {lab} (x{cnt})")
+        if seen and agg_seen:
+            print("\nDOM probe: seen labels (for reference):")
+            for key in sorted(agg_seen.keys()):
+                print(f"- {key}")
+                items = sorted(agg_seen[key].items(), key=lambda kv: kv[1], reverse=True)
+                for lab, cnt in items[:40]:
+                    print(f"  • {lab} (x{cnt})")
         return 0
 
     return await _with_browser(headless, run, profile_dir=profile_dir)
@@ -3645,6 +3665,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_probe_dom = sub.add_parser("probe-dom", help="Probe DOM stats labels (find unmapped rows causing NA/—)")
     p_probe_dom.add_argument("--limit", type=int, default=8)
+    p_probe_dom.add_argument("--seen", action="store_true", help="Also print all seen labels (not only unmapped)")
 
     args = parser.parse_args(argv)
     headless = not args.headed
@@ -3722,7 +3743,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "probe-stats":
         return asyncio.run(cmd_probe_stats(limit=args.limit, headless=headless, profile_dir=profile_dir))
     if args.cmd == "probe-dom":
-        return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless, profile_dir=profile_dir))
+        return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless, profile_dir=profile_dir, seen=args.seen))
     raise SystemExit(2)
 
 
