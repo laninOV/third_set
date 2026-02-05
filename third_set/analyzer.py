@@ -25,6 +25,8 @@ from third_set.modules import (
 )
 from third_set.sofascore import (
     SofascoreError,
+    SOFASCORE_TENNIS_URL,
+    _sofascore_base_from_url,
     get_event_votes,
     get_last_finished_singles_events,
     get_event_from_match_url_auto,
@@ -57,6 +59,15 @@ class MatchContext:
 def _dbg(msg: str) -> None:
     if os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes"):
         print(f"[debug] {msg}", flush=True)
+
+
+def _log_step(msg: str) -> None:
+    """
+    Verbose progress logging for long-running analysis.
+    Enabled when THIRDSET_PROGRESS or THIRDSET_TG_LOG is set.
+    """
+    if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+        print(f"[progress] {msg}", flush=True)
 
 
 def _metric_summary_to_dict(ms: Optional[MetricSummary]) -> Optional[Dict[str, Any]]:
@@ -1091,6 +1102,11 @@ async def _history_rows_for_player_audit(
         per_event_timeout_s = 18.0
     per_event_timeout_s = max(8.0, min(45.0, per_event_timeout_s))
 
+    def _nav_timeout_ms(total_s: float) -> int:
+        # Keep navigation under the per-event budget to avoid hard timeouts.
+        ms = int(float(total_s) * 1000.0 * 0.6)
+        return max(8_000, min(20_000, ms))
+
     try:
         player_budget_s = float(os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S") or "75")
     except Exception:
@@ -1112,6 +1128,9 @@ async def _history_rows_for_player_audit(
         except Exception:
             prof = {}
         profile_url = prof.get(match_side) if isinstance(prof, dict) else None
+        _log_step(
+            f"History[{progress_label or match_side}]: profile_url={'yes' if isinstance(profile_url, str) and profile_url else 'no'}"
+        )
         if isinstance(profile_url, str) and profile_url:
             try:
                 # Player pages may contain many upcoming/live matches first; we need enough depth to reach finished ones.
@@ -1120,6 +1139,7 @@ async def _history_rows_for_player_audit(
                 )
             except Exception:
                 links = []
+    _log_step(f"History[{progress_label or match_side}]: links={len(links)}")
     # 2) Fallback within DOM-only approach: try constructing the profile URL from slug/id (can 404).
     if not links and isinstance(team_slug, str) and team_slug.strip():
         try:
@@ -1128,6 +1148,7 @@ async def _history_rows_for_player_audit(
             )
         except Exception:
             links = []
+        _log_step(f"History[{progress_label or match_side}]: links_fallback={len(links)}")
         # Resolve only as much as needed (finished singles), respecting time budget.
         for link in links:
             if asyncio.get_running_loop().time() >= deadline:
@@ -1183,6 +1204,7 @@ async def _history_rows_for_player_audit(
                     break
             except Exception:
                 continue
+    _log_step(f"History[{progress_label or match_side}]: candidate_events={len(events)}")
 
     # No API fallbacks for history candidates: source of truth is player page DOM.
     if surface_filter:
@@ -1252,20 +1274,35 @@ async def _history_rows_for_player_audit(
             try:
                 slug = ev.get("slug")
                 custom = ev.get("customId")
+                base = _sofascore_base_from_url(hist_page.url or SOFASCORE_TENNIS_URL)
                 if slug and custom:
-                    url = f"https://www.sofascore.com/ru/tennis/match/{slug}/{custom}"
+                    url = f"{base}/tennis/match/{slug}/{custom}"
                 else:
-                    url = f"https://www.sofascore.com/event/{int(eid)}"
+                    url = f"{base}/event/{int(eid)}"
                 periods = ("1ST", "2ND", "3RD") if has_set3 else ("1ST", "2ND")
                 try:
+                    _log_step(f"History[{progress_label or match_side}]: stats eid={eid} url={url}")
                     stats = await asyncio.wait_for(
-                        extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
+                        extract_statistics_dom(
+                            hist_page,
+                            match_url=url,
+                            event_id=int(eid),
+                            periods=periods,
+                            nav_timeout_ms=_nav_timeout_ms(per_event_timeout_s),
+                        ),
                         timeout=per_event_timeout_s,
                     )
                 except asyncio.TimeoutError:
                     retry_t = min(45.0, max(per_event_timeout_s * 2.0, per_event_timeout_s + 8.0))
+                    _log_step(f"History[{progress_label or match_side}]: retry stats eid={eid} t={retry_t}")
                     stats = await asyncio.wait_for(
-                        extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
+                        extract_statistics_dom(
+                            hist_page,
+                            match_url=url,
+                            event_id=int(eid),
+                            periods=periods,
+                            nav_timeout_ms=_nav_timeout_ms(retry_t),
+                        ),
                         timeout=retry_t,
                     )
                 except Exception as ex:
@@ -1275,8 +1312,15 @@ async def _history_rows_for_player_audit(
                     msg = str(ex)
                     if "Execution context was destroyed" in msg or "most likely because of a navigation" in msg:
                         await asyncio.sleep(0.35)
+                        _log_step(f"History[{progress_label or match_side}]: retry nav ctx eid={eid}")
                         stats = await asyncio.wait_for(
-                            extract_statistics_dom(hist_page, match_url=url, event_id=int(eid), periods=periods),
+                            extract_statistics_dom(
+                                hist_page,
+                                match_url=url,
+                                event_id=int(eid),
+                                periods=periods,
+                                nav_timeout_ms=_nav_timeout_ms(per_event_timeout_s + 5.0),
+                            ),
                             timeout=min(45.0, max(per_event_timeout_s * 1.5, per_event_timeout_s + 5.0)),
                         )
                     else:
@@ -1292,6 +1336,7 @@ async def _history_rows_for_player_audit(
             if dom_err:
                 summary = dict(summary)
                 summary["dom_error"] = dom_err
+                _log_step(f"History[{progress_label or match_side}]: dom_stats_error eid={eid} err={dom_err}")
             return idx, None, "dom_stats_error", summary
 
         snap = MatchSnapshot(event_id=int(eid), stats=stats) if stats is not None else None
@@ -1721,6 +1766,7 @@ async def analyze_once(
     audit_history: bool = False,
     audit_features: bool = False,
 ) -> Tuple[MatchContext, List[ModuleResult], str, int, Dict[str, Any]]:
+    _log_step(f"analyze_once start eventId={event_id} history_only={history_only}")
     e = event_payload.get("event") or {}
     home = e.get("homeTeam") or {}
     away = e.get("awayTeam") or {}
@@ -1749,6 +1795,7 @@ async def analyze_once(
         for _ in range(5):
             try:
                 _dbg(f"DOM stats: eventId={event_id} (1ST+2ND)")
+                _log_step(f"DOM stats: eventId={event_id} attempt")
                 stats = await asyncio.wait_for(
                     extract_statistics_dom(page, match_url=match_url, event_id=event_id, periods=("1ST", "2ND")),
                     timeout=60.0,
@@ -1785,6 +1832,7 @@ async def analyze_once(
     votes_payload: Optional[Dict[str, Any]] = None
     try:
         _dbg(f"Votes: eventId={event_id}")
+        _log_step(f"Votes: eventId={event_id}")
         votes_payload = await get_event_votes(page, event_id)
     except Exception:
         votes_payload = None
@@ -1803,8 +1851,10 @@ async def analyze_once(
     # We scrape sequentially in the same tab by default.
     history_pool = int(max_history)
     _dbg(f"History: pool={history_pool} (sequential, single tab)")
+    _log_step(f"History: pool={history_pool}")
 
     _dbg(f"History: home teamId={ctx.home_id} max={history_pool}")
+    _log_step(f"History: home teamId={ctx.home_id}")
     rows_home_pool, audit_home = await _history_rows_for_player_audit(
         page,
         match_url=match_url,
@@ -1817,6 +1867,7 @@ async def analyze_once(
         progress_label="home",
     )
     _dbg(f"History: away teamId={ctx.away_id} max={history_pool}")
+    _log_step(f"History: away teamId={ctx.away_id}")
     rows_away_pool, audit_away = await _history_rows_for_player_audit(
         page,
         match_url=match_url,
@@ -1829,6 +1880,9 @@ async def analyze_once(
         progress_label="away",
     )
     pool_n = min(len(rows_home_pool), len(rows_away_pool), history_pool)
+    _log_step(
+        f"History: collected home={len(rows_home_pool)}/{history_pool} away={len(rows_away_pool)}/{history_pool} pool_n={pool_n}"
+    )
     if pool_n <= 0:
         raise SofascoreError(
             f"История не собрана (home={len(rows_home_pool)}/{history_pool}, away={len(rows_away_pool)}/{history_pool}). "

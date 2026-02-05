@@ -19,6 +19,7 @@ from third_set.sofascore import (
     SOFASCORE_TENNIS_URL,
     LiveEvent,
     SofascoreError,
+    _sofascore_base_from_url,
     discover_match_links,
     discover_live_cards_dom,
     discover_upcoming_cards_dom,
@@ -2798,9 +2799,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     stop_flag = {"stop": False}
     active_task: Dict[str, Optional[asyncio.Task]] = {"task": None}
     try:
-        analyze_timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "180")
+        analyze_timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "240")
     except Exception:
-        analyze_timeout_s = 180
+        analyze_timeout_s = 240
 
     async def send(text: str) -> None:
         # Optional debug prefix to detect “stale bot instance” issues.
@@ -2976,6 +2977,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             home = ((ev.get("homeTeam") or {}).get("name")) or str(c.get("home") or "—")
             away = ((ev.get("awayTeam") or {}).get("name")) or str(c.get("away") or "—")
             print(f"[TG] analyze_upcoming: {i}/{len(filtered)} id={eid} {home} vs {away}", flush=True)
+            if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                print(f"[TG] progress: analyzing {i}/{len(filtered)} eventId={eid}", flush=True)
             try:
                 await _analyze_event(page, ev)  # history_only будет выбран автоматически (сеты не 1:1)
                 ok += 1
@@ -2996,37 +2999,58 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             event_id = int(e.get("id"))
             slug = e.get("slug")
             custom = e.get("customId")
-            match_url = f"https://www.sofascore.com/ru/tennis/match/{slug}/{custom}" if slug and custom else f"https://www.sofascore.com/event/{event_id}"
+            base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+            match_url = f"{base}/tennis/match/{slug}/{custom}" if slug and custom else f"{base}/event/{event_id}"
             history_only = not _is_set_score_1_1_after_two_sets(payload)
-            async with nav_lock:
-                ctx, mods, final_side, score, meta = await asyncio.wait_for(
-                    analyze_once(
-                        page,
-                        event_payload=payload,
-                        match_url=match_url,
-                        event_id=event_id,
-                        max_history=max_history,
-                        history_only=history_only,
-                        progress_cb=progress_cb,
-                        audit_history=False,
-                        audit_features=True,
-                    ),
-                    timeout=analyze_timeout_s,
+            if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                print(
+                    f"[TG] analyze_event start eventId={event_id} history_only={history_only} url={match_url}",
+                    flush=True,
                 )
-            meta["mode"] = "normal"
-            msg = _format_tg_message(
-                event_id=ctx.event_id,
-                match_url=ctx.url,
-                home_name=ctx.home_name,
-                away_name=ctx.away_name,
-                set2_winner=ctx.set2_winner,
-                decision="SKIP",
-                decision_side="neutral",
-                score=score,
-                meta=meta,
-                mods=mods,
-            )
-            await asyncio.to_thread(client.send_text_result, msg, reply_markup=reply_markup)
+            # Retry once on timeout with a larger budget (server often slow / CF).
+            last_timeout = None
+            for attempt in range(2):
+                try:
+                    tlim = analyze_timeout_s if attempt == 0 else int(analyze_timeout_s * 1.5)
+                    if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                        print(f"[TG] analyze_event attempt={attempt+1} timeout={tlim}s eventId={event_id}", flush=True)
+                    async with nav_lock:
+                        ctx, mods, final_side, score, meta = await asyncio.wait_for(
+                            analyze_once(
+                                page,
+                                event_payload=payload,
+                                match_url=match_url,
+                                event_id=event_id,
+                                max_history=max_history,
+                                history_only=history_only,
+                                progress_cb=progress_cb,
+                                audit_history=False,
+                                audit_features=True,
+                            ),
+                            timeout=tlim,
+                        )
+                    meta["mode"] = "normal"
+                    msg = _format_tg_message(
+                        event_id=ctx.event_id,
+                        match_url=ctx.url,
+                        home_name=ctx.home_name,
+                        away_name=ctx.away_name,
+                        set2_winner=ctx.set2_winner,
+                        decision="SKIP",
+                        decision_side="neutral",
+                        score=score,
+                        meta=meta,
+                        mods=mods,
+                    )
+                    await asyncio.to_thread(client.send_text_result, msg, reply_markup=reply_markup)
+                    return
+                except asyncio.TimeoutError as ex:
+                    last_timeout = ex
+                    if attempt == 0:
+                        # brief backoff before retry
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise ex
         except asyncio.CancelledError:
             # Let cancellations propagate so "Стоп текущий" actually stops long jobs.
             raise
@@ -3333,15 +3357,19 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         if pending_upcoming.get(chat_id):
                             hrs = None
                             try:
-                                m = re.findall(r"\\d+(?:[\\.,]\\d+)?", text)
+                                raw_text = (text or "").strip()
+                                m = re.findall(r"\\d+(?:[\\.,]\\d+)?", raw_text)
                                 if m:
                                     hrs = float(m[0].replace(",", "."))
                             except Exception:
                                 hrs = None
-                            pending_upcoming[chat_id] = False
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print(f"[TG] upcoming input={text!r} parsed={hrs}", flush=True)
                             if hrs is None or hrs <= 0:
                                 await send("Не понял окно. Пришли число часов, например 1 или 2.")
+                                # keep pending to allow retry
                                 continue
+                            pending_upcoming[chat_id] = False
                             if active_task["task"] and not active_task["task"].done():
                                 await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
                                 continue
@@ -3533,6 +3561,38 @@ async def cmd_probe_dom(*, limit: int, headless: bool, profile_dir: Optional[str
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Optional tee logging to file (keeps console output).
+    log_path = os.getenv("THIRDSET_LOG_FILE")
+    if log_path:
+        try:
+            class _Tee:
+                def __init__(self, primary, secondary):
+                    self._primary = primary
+                    self._secondary = secondary
+                def write(self, s):
+                    try:
+                        self._primary.write(s)
+                    except Exception:
+                        pass
+                    try:
+                        self._secondary.write(s)
+                    except Exception:
+                        pass
+                def flush(self):
+                    try:
+                        self._primary.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._secondary.flush()
+                    except Exception:
+                        pass
+            log_f = open(log_path, "a", encoding="utf-8")
+            sys.stdout = _Tee(sys.stdout, log_f)
+            sys.stderr = _Tee(sys.stderr, log_f)
+            print(f"[log] writing to {log_path}", flush=True)
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(prog="third_set")
     parser.add_argument("--headed", action="store_true", help="Run with visible browser window")
     parser.add_argument(

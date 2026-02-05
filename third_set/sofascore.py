@@ -16,6 +16,55 @@ SOFASCORE_API_BASE = "https://www.sofascore.com/api/v1"
 SOFASCORE_TENNIS_LIVE_API = f"{SOFASCORE_API_BASE}/sport/tennis/events/live"
 
 
+_LOCALE_RE = re.compile(r"^/[a-z]{2}(-[a-z]{2})?$", re.I)
+
+
+def _sofascore_base_from_url(url: str) -> str:
+    """
+    Return base URL with locale if present, e.g.:
+      https://www.sofascore.com/ru
+      https://www.sofascore.com/en-us
+    Falls back to https://www.sofascore.com when missing.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return "https://www.sofascore.com"
+    m = re.match(r"^(https?://www\\.sofascore\\.com)(/[^/]+)?", raw)
+    if not m:
+        return "https://www.sofascore.com"
+    base = m.group(1)
+    loc = m.group(2) or ""
+    if loc and _LOCALE_RE.match(loc):
+        return base + loc
+    return base
+
+
+def _tennis_url_from_page(page: Page) -> str:
+    try:
+        cur = page.url or ""
+    except Exception:
+        cur = ""
+    base = _sofascore_base_from_url(cur) or "https://www.sofascore.com"
+    return f"{base}/tennis"
+
+
+async def _safe_goto(page: Page, url: str, *, timeout_ms: int = 25_000) -> None:
+    """
+    Robust navigation helper:
+    - try domcontentloaded
+    - on timeout, retry with wait_until='commit'
+    """
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
+    try:
+        await page.goto(url, wait_until="commit", timeout=timeout_ms)
+    except Exception:
+        pass
+
+
 class SofascoreError(RuntimeError):
     pass
 
@@ -78,9 +127,10 @@ async def warm_player_page(page: Page, *, team_id: int, team_slug: str) -> None:
     slug = (team_slug or "").strip()
     if not slug:
         return
-    url = f"https://www.sofascore.com/ru/tennis/player/{slug}/{int(team_id)}"
+    base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+    url = f"{base}/tennis/player/{slug}/{int(team_id)}"
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+        await _safe_goto(page, url, timeout_ms=25_000)
     except Exception:
         return
     try:
@@ -101,7 +151,7 @@ async def discover_player_profile_urls_from_match(page: Page, *, match_url: str,
     Returns: {"home": url, "away": url} when available.
     """
     target = match_url.split("#", 1)[0] + f"#id:{int(event_id)}"
-    await page.goto(target, wait_until="domcontentloaded", timeout=25_000)
+    await _safe_goto(page, target, timeout_ms=25_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=12_000)
     except Exception:
@@ -158,8 +208,9 @@ async def discover_player_match_links(page: Page, *, team_id: int, team_slug: st
     slug = (team_slug or "").strip()
     if not slug:
         return []
-    url = f"https://www.sofascore.com/ru/tennis/player/{slug}/{int(team_id)}"
-    await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+    base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+    url = f"{base}/tennis/player/{slug}/{int(team_id)}"
+    await _safe_goto(page, url, timeout_ms=25_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=12_000)
     except Exception:
@@ -210,7 +261,7 @@ async def discover_player_match_links_from_profile_url(page: Page, *, profile_ur
     url = (profile_url or "").strip()
     if not url:
         return []
-    await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+    await _safe_goto(page, url, timeout_ms=25_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=12_000)
     except Exception:
@@ -247,6 +298,27 @@ async def discover_player_match_links_from_profile_url(page: Page, *, profile_ur
         except Exception:
             pass
 
+    # Try "Show more" / "Показать больше" to reveal more matches.
+    for _ in range(6):
+        clicked = False
+        for rx in (
+            re.compile(r"Показать\\s+ещё", re.I),
+            re.compile(r"Показать\\s+больше", re.I),
+            re.compile(r"Show\\s+more", re.I),
+            re.compile(r"Load\\s+more", re.I),
+        ):
+            try:
+                btn = page.locator("button, a").filter(has_text=rx)
+                if await btn.count() and await btn.first.is_visible():
+                    await btn.first.click(timeout=2000, force=True)
+                    await page.wait_for_timeout(700)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if not clicked:
+            break
+
     # Prefer finished results when available (player pages often default to "Сегодня/Upcoming").
     for rx in (re.compile(r"Законч", re.I), re.compile(r"Finished", re.I), re.compile(r"Результаты", re.I)):
         try:
@@ -271,9 +343,9 @@ async def discover_player_match_links_from_profile_url(page: Page, *, profile_ur
 
     # Scroll to load matches list.
     try:
-        for _ in range(14):
+        for _ in range(18):
             await page.mouse.wheel(0, 1600)
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(300)
     except Exception:
         pass
 
@@ -510,7 +582,7 @@ async def _collect_json_via_navigation(
 
     page.on("response", _on_response)
     try:
-        await page.goto(url_to_open, wait_until="domcontentloaded", timeout=25000)
+        await _safe_goto(page, url_to_open, timeout_ms=25000)
         done: set = set()
         remaining = set(futures.keys())
         # Wait until all required keys are satisfied (or timeout).
@@ -583,7 +655,8 @@ class LiveEvent:
 
     @property
     def match_url(self) -> str:
-        return f"https://www.sofascore.com/ru/tennis/match/{self.slug}/{self.custom_id}"
+        base = _sofascore_base_from_url(os.getenv("THIRDSET_BASE_URL", "") or SOFASCORE_TENNIS_URL)
+        return f"{base}/tennis/match/{self.slug}/{self.custom_id}"
 
 
 def _tab_cfg(tab: str) -> Tuple[re.Pattern, str, str]:
@@ -622,7 +695,7 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
     if "sofascore.com" in cur_url and "/tennis" in cur_url:
         need_nav = False
     if need_nav:
-        await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=45_000)
+        await _safe_goto(page, _tennis_url_from_page(page), timeout_ms=45_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
@@ -1240,7 +1313,7 @@ async def get_event_from_match_url_auto(page: Page, match_url: str, *, timeout_m
 
     page.on("response", _on_response)
     try:
-        await page.goto(match_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await _safe_goto(page, match_url, timeout_ms=timeout_ms)
         try:
             await page.wait_for_load_state("networkidle", timeout=timeout_ms)
         except Exception:
@@ -1278,14 +1351,40 @@ async def get_event(page: Page, event_id: int) -> Dict[str, Any]:
     return await fetch_json_via_page(page, f"{SOFASCORE_API_BASE}/event/{event_id}")
 
 async def get_event_via_navigation(page: Page, event_id: int, *, timeout_ms: int = 15000) -> Dict[str, Any]:
-    captured = await _collect_json_via_navigation(
-        page,
-        url_to_open=f"https://www.sofascore.com/event/{event_id}",
-        predicates={"event": lambda r: r.url.endswith(f"/api/v1/event/{event_id}")},
-        required_keys={"event"},
-        timeout_ms=timeout_ms,
-    )
-    return captured["event"]
+    """
+    Robust event fetch:
+    1) try in-page fetch (no navigation) — avoids slow page.goto on weak servers
+    2) fallback to navigation-capture with retry/backoff
+    """
+    # Allow env override for slow servers.
+    try:
+        timeout_ms = int(os.getenv("THIRDSET_EVENT_TIMEOUT_MS", str(timeout_ms)))
+    except Exception:
+        pass
+    # Fast path: fetch inside the page context (same cookies/session).
+    try:
+        return await fetch_json_via_page(page, f"{SOFASCORE_API_BASE}/event/{event_id}")
+    except Exception:
+        pass
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+            captured = await _collect_json_via_navigation(
+                page,
+                url_to_open=f"{base}/event/{event_id}",
+                predicates={"event": lambda r: r.url.endswith(f"/api/v1/event/{event_id}")},
+                required_keys={"event"},
+                timeout_ms=timeout_ms,
+            )
+            return captured["event"]
+        except Exception as ex:
+            last_err = ex
+            await page.wait_for_timeout(800 * (attempt + 1))
+            continue
+    if last_err:
+        raise last_err
+    raise SofascoreError("event fetch failed")
 
 
 async def get_event_statistics(page: Page, event_id: int) -> Dict[str, Any]:
@@ -1296,9 +1395,10 @@ async def get_event_statistics_via_navigation(page: Page, event_id: int, *, time
     Capture /api/v1/event/<id>/statistics from network while navigating like a real user.
     More CF-resistant than direct fetch().
     """
+    base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
     captured = await _collect_json_via_navigation(
         page,
-        url_to_open=f"https://www.sofascore.com/event/{event_id}",
+        url_to_open=f"{base}/event/{event_id}",
         predicates={"statistics": lambda r: r.url.endswith(f"/api/v1/event/{event_id}/statistics")},
         required_keys={"statistics"},
         timeout_ms=timeout_ms,

@@ -13,13 +13,31 @@ class DomStatsError(RuntimeError):
     pass
 
 
-_NAV_TIMEOUT_MS = 25_000
-_UI_TIMEOUT_MS = 6_000
+try:
+    _NAV_TIMEOUT_MS = int(os.getenv("THIRDSET_NAV_TIMEOUT_MS", "45000"))
+except Exception:
+    _NAV_TIMEOUT_MS = 45_000
+try:
+    _UI_TIMEOUT_MS = int(os.getenv("THIRDSET_UI_TIMEOUT_MS", "10000"))
+except Exception:
+    _UI_TIMEOUT_MS = 10_000
 
 
 def _dbg(msg: str) -> None:
     if os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes"):
         print(f"[dom] {msg}", flush=True)
+
+
+async def _safe_goto(page: Page, url: str, *, timeout_ms: int) -> None:
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
+    try:
+        await page.goto(url, wait_until="commit", timeout=timeout_ms)
+    except Exception:
+        pass
 
 async def _is_varnish_503(page: Page) -> bool:
     """
@@ -77,6 +95,7 @@ _ITEM_MAP: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("Service", "First serve points"): ("Service", "First serve points"),
     ("Service", "Поинты второй подачи"): ("Service", "Second serve points"),
     ("Service", "Second serve points"): ("Service", "Second serve points"),
+    ("Service", "Сыгранные подачи"): ("Games", "Service games played"),
     ("Service", "Брейк-поинты защищены"): ("Service", "Break points saved"),
     ("Service", "Брейк-пойнты защищены"): ("Service", "Break points saved"),
     ("Service", "Брейк-пойнты отыграны"): ("Service", "Break points saved"),
@@ -110,10 +129,12 @@ _ITEM_MAP: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("Points", "Очки, выигранные на своей подаче"): ("Points", "Service points won"),
     ("Points", "Очки, выигранные на приёме"): ("Points", "Receiver points won"),
     ("Points", "Очки, выигранные на приеме"): ("Points", "Receiver points won"),
+    ("Points", "Максимум очков подряд"): ("Miscellaneous", "Max points in a row"),
     # Games
     ("Games", "Выигранные подачи"): ("Games", "Service games won"),
     ("Games", "Service games won"): ("Games", "Service games won"),
     ("Games", "Выигранные подачи соперника"): ("Games", "Return games won"),
+    ("Games", "Максимум геймов подряд"): ("Miscellaneous", "Max games in a row"),
     # Misc
     ("Miscellaneous", "Тай-брейки"): ("Miscellaneous", "Tiebreaks"),
     ("Miscellaneous", "Tiebreaks"): ("Miscellaneous", "Tiebreaks"),
@@ -631,7 +652,12 @@ async def _select_period(page: Page, period_code: str) -> bool:
 
 
 async def extract_statistics_dom(
-    page: Page, *, match_url: str, event_id: int, periods: Tuple[str, ...] = ("1ST", "2ND")
+    page: Page,
+    *,
+    match_url: str,
+    event_id: int,
+    periods: Tuple[str, ...] = ("1ST", "2ND"),
+    nav_timeout_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Extract per-period tennis statistics from Sofascore DOM ("Статистика" tab).
@@ -643,6 +669,7 @@ async def extract_statistics_dom(
     # Sofascore can redirect between locales (e.g. /ru/ -> /en-us/), so we match by the
     # locale-independent path `/tennis/match/<slug>/<customId>` rather than full prefix.
     target = match_url + f"#id:{event_id}"
+    nav_timeout = int(nav_timeout_ms) if isinstance(nav_timeout_ms, int) and nav_timeout_ms > 0 else _NAV_TIMEOUT_MS
 
     def _match_identity(url: str) -> str:
         try:
@@ -662,11 +689,14 @@ async def extract_statistics_dom(
         last_err: Optional[Exception] = None
         for attempt in range(4):
             try:
-                await page.goto(target, wait_until="domcontentloaded", timeout=max(_NAV_TIMEOUT_MS, 45_000))
+                await _safe_goto(page, target, timeout_ms=nav_timeout)
+                # Avoid waiting for networkidle here: Sofascore keeps background requests alive.
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=15_000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=4_000)
                 except Exception:
                     pass
+                # Small settle to let the tab strip and stats hydrate.
+                await page.wait_for_timeout(250)
                 if await _is_varnish_503(page):
                     # transient backend cache error; wait and retry
                     wait_ms = 800 * (attempt + 1)
@@ -677,6 +707,11 @@ async def extract_statistics_dom(
                 break
             except Exception as ex:
                 last_err = ex
+                # If we timed out but the URL already matches, continue with DOM scraping.
+                have_id = _match_identity(page.url or "")
+                if want_id and have_id == want_id:
+                    last_err = None
+                    break
                 # short backoff and retry
                 await page.wait_for_timeout(700 * (attempt + 1))
                 continue
@@ -686,11 +721,12 @@ async def extract_statistics_dom(
         # Even if we think we're on the same match, Sofascore might have returned a 503 page.
         if await _is_varnish_503(page):
             _dbg("varnish_503 on same match; reloading")
-            await page.goto(target, wait_until="domcontentloaded", timeout=max(_NAV_TIMEOUT_MS, 45_000))
+            await _safe_goto(page, target, timeout_ms=nav_timeout)
             try:
-                await page.wait_for_load_state("networkidle", timeout=15_000)
+                await page.wait_for_load_state("domcontentloaded", timeout=4_000)
             except Exception:
                 pass
+            await page.wait_for_timeout(250)
             if await _is_varnish_503(page):
                 raise DomStatsError("Sofascore 503 backend read error (Varnish)")
 

@@ -1,0 +1,119 @@
+[log] writing to ./third_set.log
+DOM probe: unmapped labels (add these to _ITEM_MAP):
+- 1ST:Games
+  * Максимум геймов подряд (x5)
+- 1ST:Points
+  * Максимум очков подряд (x5)
+- 1ST:Service
+  * Сыгранные подачи (x5)
+- 2ND:Games
+  * Максимум геймов подряд (x5)
+- 2ND:Points
+  * Максимум очков подряд (x5)
+- 2ND:Service
+  * Сыгранные подачи (x5)
+
+DOM probe: seen labels (for reference):
+- 1ST:Games
+  • Максимум геймов подряд (x5)
+- 1ST:Miscellaneous
+  • Тай-брейки (x5)
+- 1ST:Points
+  • Максимум очков подряд (x5)
+  • Очки, выигранные на подаче соперника (x5)
+  • Очки, выигранные на своей подаче (x5)
+- 1ST:Return
+  • Брейк-поинты использованы (x5)
+  • Поинты второй подачи (x5)
+  • Поинты первой подачи (x5)
+  • Сыграно ответных матчей (x5)
+- 1ST:Service
+  • Вторая подача (x5)
+  • Двойные ошибки (x5)
+  • Первая подача (x5)
+  • Поинты второй подачи (x5)
+  • Поинты первой подачи (x5)
+  • Сыгранные подачи (x5)
+  • Эйсы (x5)
+  • Брейк-поинты защищены (x4)
+- 2ND:Games
+  • Максимум геймов подряд (x5)
+- 2ND:Miscellaneous
+  • Тай-брейки (x5)
+- 2ND:Points
+  • Максимум очков подряд (x5)
+  • Очки, выигранные на подаче соперника (x5)
+  • Очки, выигранные на своей подаче (x5)
+- 2ND:Return
+  • Брейк-поинты использованы (x5)
+  • Поинты второй подачи (x5)
+  • Поинты первой подачи (x5)
+  • Сыграно ответных матчей (x5)
+- 2ND:Service
+  • Брейк-поинты защищены (x5)
+  • Вторая подача (x5)
+  • Двойные ошибки (x5)
+  • Первая подача (x5)
+  • Поинты второй подачи (x5)
+  • Поинты первой подачи (x5)
+  • Сыгранные подачи (x5)
+  • Эйсы (x5)
+[log] writing to ./third_set.log
+TG bot: starting…
+TG bot: chat_id=955845459
+[TG] warmup: title='Tennis live scores and today’s schedule | Sofascore' url='https://www.sofascore.com/en-us/tennis'
+TG bot: ready (waiting for updates)
+[TG] drained backlog to offset=264809731
+[TG] msg from 955845459 @tut_oleg: Анализ всех live
+[TG] action: analyze_all
+[TG] live(dom): cards=19
+[TG] analyze_all: найдено live=19
+[TG] analyze_all: 1/19 id=15441189 Arthur Gea vs Tomas Machac
+[TG] analyze_event start eventId=15441189 history_only=True url=https://www.sofascore.com/tennis/match/arthur-gea-tomas-machac/aqVbsMEdd
+[TG] analyze_event attempt=1 timeout=240s eventId=15441189
+[progress] analyze_once start eventId=15441189 history_only=True
+[progress] Votes: eventId=15441189
+[progress] History: pool=5
+[progress] History: home teamId=383987
+[progress] History[home]: profile_url=yes
+[progress] History[home]: links=10
+[progress] History[home]: candidate_events=9
+[progress] History[home]: stats eid=15459227 url=https://www.sofascore.com/tennis/match/arthur-gea-giovanni-mpetshi-perricard/WHpcsMEdd
+[progress] History[home]: retry stats eid=15459227 t=36.0
+[progress] History[home]: dom_stats_error eid=15459227 err=TimeoutError: 
+[progress] History[home]: stats eid=15345251 url=https://www.sofascore.com/tennis/match/arthur-gea-stan-wawrinka/YPfsMEdd
+[progress] History[home]: retry stats eid=15345251 t=36.0
+[TG] msg from 955845459 @tut_oleg: Анализ всех live
+[TG] action: analyze_all
+[progress] History[home]: dom_stats_error eid=15345251 err=TimeoutError: 
+[progress] History: away teamId=238300
+[progress] History[away]: profile_url=yes
+[progress] History[away]: links=10
+[progress] History[away]: candidate_events=9
+[progress] History[away]: stats eid=15345275 url=https://www.sofascore.com/tennis/match/lorenzo-musetti-tomas-machac/aqVbspvec
+[progress] History[away]: retry stats eid=15345275 t=36.0
+[progress] History[away]: dom_stats_error eid=15345275 err=TimeoutError: 
+[progress] History[away]: stats eid=15345250 url=https://www.sofascore.com/tennis/match/tomas-machac-stefanos-tsitsipas/qXYsaqVb
+[progress] History[away]: retry stats eid=15345250 t=36.0
+[progress] History[away]: dom_stats_error eid=15345250 err=TimeoutError: 
+[progress] History: collected home=0/5 away=0/5 pool_n=0
+[TG] analyze_all: 2/19 id=15440889 Chun-Hsin Tseng vs Facundo Mena
+[TG] analyze_event start eventId=15440889 history_only=True url=https://www.sofascore.com/tennis/match/chun-hsin-tseng-facundo-mena/FnpsJPHb
+[TG] analyze_event attempt=1 timeout=240s eventId=15440889
+[progress] analyze_once start eventId=15440889 history_only=True
+[progress] Votes: eventId=15440889
+[progress] History: pool=5
+[progress] History: home teamId=207034
+[progress] History[home]: profile_url=yes
+[progress] History[home]: links=10
+[progress] History[home]: candidate_events=9
+[progress] History[home]: stats eid=15470915 url=https://www.sofascore.com/tennis/match/chun-hsin-tseng-hernan-casanova/AZwsJPHb
+[progress] History[home]: retry stats eid=15470915 t=36.0
+[progress] History[home]: dom_stats_error eid=15470915 err=TimeoutError: 
+[progress] History[home]: stats eid=15403304 url=https://www.sofascore.com/tennis/match/chun-hsin-tseng-marco-cecchinato/ZPrsJPHb
+[progress] History[home]: retry stats eid=15403304 t=36.0
+[TG] msg from 955845459 @tut_oleg: Выключить бота
+[TG] action: stop_requested
+[TG] msg from 955845459 @tut_oleg: СТОП
+[TG] task cancelled
+[progress] History[home]: dom_stats_error eid=15403304 err=TargetClosedError: Page.wait_for_timeout: Target page, context or browser has been closed
