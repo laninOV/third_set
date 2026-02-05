@@ -1884,9 +1884,42 @@ async def analyze_once(
         f"History: collected home={len(rows_home_pool)}/{history_pool} away={len(rows_away_pool)}/{history_pool} pool_n={pool_n}"
     )
     if pool_n <= 0:
+        def _fmt_audit(side: str, audit: HistoryAudit) -> str:
+            try:
+                parts: List[str] = []
+                parts.append(
+                    f"{side}: cand={audit.candidates} scanned={audit.scanned} valid={audit.valid}"
+                )
+                if isinstance(audit.excluded_by_reason, dict) and audit.excluded_by_reason:
+                    top = sorted(
+                        ((k, int(v)) for k, v in audit.excluded_by_reason.items()),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )
+                    top = top[:4]
+                    parts.append("reasons=" + ",".join(f"{k}:{v}" for k, v in top))
+                dom_err = None
+                if isinstance(audit.excluded_events, list):
+                    for evx in audit.excluded_events:
+                        if isinstance(evx, dict) and evx.get("dom_error"):
+                            dom_err = str(evx.get("dom_error") or "")
+                            break
+                if dom_err:
+                    # Keep it short for TG.
+                    dom_err = dom_err.strip().replace("\n", " ")
+                    if len(dom_err) > 140:
+                        dom_err = dom_err[:140] + "…"
+                    parts.append(f"dom_err={dom_err}")
+                return " ".join(parts)
+            except Exception:
+                return f"{side}: audit_error"
+
+        diag = " | ".join(
+            p for p in (_fmt_audit("home", audit_home), _fmt_audit("away", audit_away)) if p
+        )
         raise SofascoreError(
             f"История не собрана (home={len(rows_home_pool)}/{history_pool}, away={len(rows_away_pool)}/{history_pool}). "
-            f"Обычно причина: капча/блокировка Sofascore, таймауты загрузки, либо у игроков нет завершённых одиночных матчей в профиле."
+            f"Диагностика: {diag}"
         )
     if len(rows_home_pool) > pool_n:
         audit_home.dropped_to_match_opponent = len(rows_home_pool) - pool_n
