@@ -90,6 +90,24 @@ def _strength_from_pp(diff_pp: float, *, n_min: int, bands: Tuple[float, float, 
         s = min(s, 2)
     return _cap_strength(s)
 
+
+def _shrink_rate(
+    value: Optional[float],
+    *,
+    n: int,
+    prior: float = 0.5,
+    k: float = 6.0,
+) -> Optional[float]:
+    """
+    Reliability shrinkage towards prior for small sample sizes.
+    """
+    if value is None:
+        return None
+    if n <= 0:
+        return float(prior)
+    w = float(n) / float(n + max(0.1, k))
+    return float(w * float(value) + (1.0 - w) * float(prior))
+
 def module1_history_tpw12(
     *,
     rating5_home: Optional[float],
@@ -134,17 +152,22 @@ def module2_history_serve(*, cal_home: Optional[Dict[str, MetricSummary]], cal_a
         flags.append("ssw_missing")
     if bps_h is None or bps_a is None:
         flags.append("bpsr_missing")
+    # Shrink noisy rates (especially at n<=4) towards neutral baseline.
+    ssw_h_adj = _shrink_rate(ssw_h, n=n_ssw_h, k=4.0)
+    ssw_a_adj = _shrink_rate(ssw_a, n=n_ssw_a, k=4.0)
+    bps_h_adj = _shrink_rate(bps_h, n=n_bps_h, k=8.0)
+    bps_a_adj = _shrink_rate(bps_a, n=n_bps_a, k=8.0)
     # Composite in pp (0..100): 70% SSW + 30% BPSR
-    comp_h = _weighted_mean([(ssw_h, 0.70), (bps_h, 0.30)])
-    comp_a = _weighted_mean([(ssw_a, 0.70), (bps_a, 0.30)])
+    comp_h = _weighted_mean([(ssw_h_adj, 0.70), (bps_h_adj, 0.30)])
+    comp_a = _weighted_mean([(ssw_a_adj, 0.70), (bps_a_adj, 0.30)])
     if comp_h is None or comp_a is None:
         return ModuleResult("M2_second_serve", "neutral", 0, ["serve hist missing"], flags + ["missing_fields"])
     diff_pp = (comp_h - comp_a) * 100.0
     n_min = min(n_ssw_h, n_ssw_a, n_bps_h or 99, n_bps_a or 99)
     strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(3.0, 5.0, 8.0))
     side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
-    explain.append(f"SSW12={ssw_h:.3f}/{ssw_a:.3f} n={min(n_ssw_h,n_ssw_a)}")
-    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} n={min(n_bps_h,n_bps_a)}")
+    explain.append(f"SSW12={ssw_h:.3f}/{ssw_a:.3f} adj={ssw_h_adj:.3f}/{ssw_a_adj:.3f} n={min(n_ssw_h,n_ssw_a)}")
+    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} adj={bps_h_adj if bps_h_adj is not None else None}/{bps_a_adj if bps_a_adj is not None else None} n={min(n_bps_h,n_bps_a)}")
     explain.append(f"CompositeServe={diff_pp:+.1f}pp")
     return ModuleResult("M2_second_serve", side if strength > 0 else "neutral", strength, explain, flags)
 
@@ -161,16 +184,20 @@ def module3_history_return(*, cal_home: Optional[Dict[str, MetricSummary]], cal_
     rpr_a, n_rpr_a = _metric_mean_n(cal_away, "rpr_12")
     bpc_h, n_bpc_h = _metric_mean_n(cal_home, "bpconv_12")
     bpc_a, n_bpc_a = _metric_mean_n(cal_away, "bpconv_12")
-    comp_h = _weighted_mean([(rpr_h, 0.70), (bpc_h, 0.30)])
-    comp_a = _weighted_mean([(rpr_a, 0.70), (bpc_a, 0.30)])
+    rpr_h_adj = _shrink_rate(rpr_h, n=n_rpr_h, k=4.0)
+    rpr_a_adj = _shrink_rate(rpr_a, n=n_rpr_a, k=4.0)
+    bpc_h_adj = _shrink_rate(bpc_h, n=n_bpc_h, k=8.0)
+    bpc_a_adj = _shrink_rate(bpc_a, n=n_bpc_a, k=8.0)
+    comp_h = _weighted_mean([(rpr_h_adj, 0.70), (bpc_h_adj, 0.30)])
+    comp_a = _weighted_mean([(rpr_a_adj, 0.70), (bpc_a_adj, 0.30)])
     if comp_h is None or comp_a is None:
         return ModuleResult("M3_return_pressure", "neutral", 0, ["return hist missing"], flags + ["missing_fields"])
     diff_pp = (comp_h - comp_a) * 100.0
     n_min = min(n_rpr_h, n_rpr_a, n_bpc_h or 99, n_bpc_a or 99)
     strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(3.0, 5.0, 8.0))
     side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
-    explain.append(f"RPR12={rpr_h if rpr_h is not None else None}/{rpr_a if rpr_a is not None else None} n={min(n_rpr_h,n_rpr_a)}")
-    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} n={min(n_bpc_h,n_bpc_a)}")
+    explain.append(f"RPR12={rpr_h if rpr_h is not None else None}/{rpr_a if rpr_a is not None else None} adj={rpr_h_adj if rpr_h_adj is not None else None}/{rpr_a_adj if rpr_a_adj is not None else None} n={min(n_rpr_h,n_rpr_a)}")
+    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} adj={bpc_h_adj if bpc_h_adj is not None else None}/{bpc_a_adj if bpc_a_adj is not None else None} n={min(n_bpc_h,n_bpc_a)}")
     explain.append(f"CompositeReturn={diff_pp:+.1f}pp")
     return ModuleResult("M3_return_pressure", side if strength > 0 else "neutral", strength, explain, flags)
 
@@ -187,16 +214,20 @@ def module4_history_clutch(*, cal_home: Optional[Dict[str, MetricSummary]], cal_
     bps_a, n_bps_a = _metric_mean_n(cal_away, "bpsr_12")
     bpc_h, n_bpc_h = _metric_mean_n(cal_home, "bpconv_12")
     bpc_a, n_bpc_a = _metric_mean_n(cal_away, "bpconv_12")
-    comp_h = _weighted_mean([(bps_h, 0.55), (bpc_h, 0.45)])
-    comp_a = _weighted_mean([(bps_a, 0.55), (bpc_a, 0.45)])
+    bps_h_adj = _shrink_rate(bps_h, n=n_bps_h, k=8.0)
+    bps_a_adj = _shrink_rate(bps_a, n=n_bps_a, k=8.0)
+    bpc_h_adj = _shrink_rate(bpc_h, n=n_bpc_h, k=8.0)
+    bpc_a_adj = _shrink_rate(bpc_a, n=n_bpc_a, k=8.0)
+    comp_h = _weighted_mean([(bps_h_adj, 0.55), (bpc_h_adj, 0.45)])
+    comp_a = _weighted_mean([(bps_a_adj, 0.55), (bpc_a_adj, 0.45)])
     if comp_h is None or comp_a is None:
         return ModuleResult("M4_clutch", "neutral", 0, ["clutch hist missing"], flags + ["missing_fields"])
     diff_pp = (comp_h - comp_a) * 100.0
     n_min = min(n_bps_h, n_bps_a, n_bpc_h or 99, n_bpc_a or 99)
     strength = _strength_from_pp(diff_pp, n_min=n_min, bands=(4.0, 7.0, 12.0))
     side = "home" if diff_pp > 0 else "away" if diff_pp < 0 else "neutral"
-    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} n={min(n_bps_h,n_bps_a)}")
-    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} n={min(n_bpc_h,n_bpc_a)}")
+    explain.append(f"BPSR12={bps_h if bps_h is not None else None}/{bps_a if bps_a is not None else None} adj={bps_h_adj if bps_h_adj is not None else None}/{bps_a_adj if bps_a_adj is not None else None} n={min(n_bps_h,n_bps_a)}")
+    explain.append(f"BPconv12={bpc_h if bpc_h is not None else None}/{bpc_a if bpc_a is not None else None} adj={bpc_h_adj if bpc_h_adj is not None else None}/{bpc_a_adj if bpc_a_adj is not None else None} n={min(n_bpc_h,n_bpc_a)}")
     explain.append(f"CompositeClutch={diff_pp:+.1f}pp")
     return ModuleResult("M4_clutch", side if strength > 0 else "neutral", strength, explain, flags)
 

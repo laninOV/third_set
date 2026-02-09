@@ -4,6 +4,7 @@ import json
 import re
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -11,12 +12,47 @@ from playwright.async_api import Page, Response
 
 from third_set.dominance import DominanceLivePoints
 
-SOFASCORE_TENNIS_URL = "https://www.sofascore.com/ru/tennis"
+SOFASCORE_TENNIS_URL = "https://www.sofascore.com/en-us/tennis"
 SOFASCORE_API_BASE = "https://www.sofascore.com/api/v1"
 SOFASCORE_TENNIS_LIVE_API = f"{SOFASCORE_API_BASE}/sport/tennis/events/live"
 
 
-_LOCALE_RE = re.compile(r"^/[a-z]{2}(-[a-z]{2})?$", re.I)
+_SOFASCORE_LOCALE_SEG_RE = re.compile(r"^/[a-z]{2}(?:-[a-z]{2})?(?=/|$)", re.I)
+
+
+def _forced_sofascore_base() -> str:
+    """
+    Canonical Sofascore base for all navigation in this project.
+    Default is EN locale to keep DOM structure stable across runs.
+    """
+    raw = (os.getenv("THIRDSET_SOFASCORE_LOCALE") or "en-us").strip().lower()
+    if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", raw):
+        return f"https://www.sofascore.com/{raw}"
+    return "https://www.sofascore.com/en-us"
+
+
+def _normalize_sofascore_url(url: str) -> str:
+    """
+    Force all sofascore URLs to the configured locale base (default: /en-us).
+    Leaves non-sofascore URLs unchanged.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return _forced_sofascore_base()
+    base = _forced_sofascore_base()
+    # Absolute sofascore URL.
+    m_abs = re.match(r"^https?://www\.sofascore\.com(?P<path>/[^?#]*)?(?P<tail>[?#].*)?$", raw, re.I)
+    if m_abs:
+        path = m_abs.group("path") or ""
+        tail = m_abs.group("tail") or ""
+        path = _SOFASCORE_LOCALE_SEG_RE.sub("", path, count=1)
+        return f"{base}{path}{tail}"
+    # Relative URL/path.
+    if raw.startswith("/"):
+        path = _SOFASCORE_LOCALE_SEG_RE.sub("", raw, count=1)
+        return f"{base}{path}"
+    # Non-sofascore absolute URL or other opaque value.
+    return raw
 
 
 def _sofascore_base_from_url(url: str) -> str:
@@ -26,17 +62,8 @@ def _sofascore_base_from_url(url: str) -> str:
       https://www.sofascore.com/en-us
     Falls back to https://www.sofascore.com when missing.
     """
-    raw = (url or "").strip()
-    if not raw:
-        return "https://www.sofascore.com"
-    m = re.match(r"^(https?://www\\.sofascore\\.com)(/[^/]+)?", raw)
-    if not m:
-        return "https://www.sofascore.com"
-    base = m.group(1)
-    loc = m.group(2) or ""
-    if loc and _LOCALE_RE.match(loc):
-        return base + loc
-    return base
+    # Locale is intentionally fixed to keep selectors and tab labels stable.
+    return _forced_sofascore_base()
 
 
 def _tennis_url_from_page(page: Page) -> str:
@@ -44,7 +71,7 @@ def _tennis_url_from_page(page: Page) -> str:
         cur = page.url or ""
     except Exception:
         cur = ""
-    base = _sofascore_base_from_url(cur) or "https://www.sofascore.com"
+    base = _sofascore_base_from_url(cur) or _forced_sofascore_base()
     return f"{base}/tennis"
 
 
@@ -236,10 +263,7 @@ async def discover_player_match_links(page: Page, *, team_id: int, team_slug: st
     seen: set = set()
     for href in hrefs:
         # Normalize to absolute.
-        if href.startswith("http"):
-            full = href
-        else:
-            full = "https://www.sofascore.com" + href
+        full = _normalize_sofascore_url(href)
         # Keep only match links.
         if "/tennis/match/" not in full:
             continue
@@ -341,35 +365,66 @@ async def discover_player_match_links_from_profile_url(page: Page, *, profile_ur
         except Exception:
             continue
 
-    # Scroll to load matches list.
-    try:
-        for _ in range(18):
-            await page.mouse.wheel(0, 1600)
-            await page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-    # Pull match links with a simple "likely finished" heuristic, so we don't waste time
-    # resolving upcoming/live matches first.
-    hrefs: List[str] = await page.evaluate(
-        """
-        () => {
-          function norm(s){return (s||'').replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g,' ').replace(/\\s+/g,' ').trim();}
-          const rxScore = /\\b\\d+\\s*[:\\-]\\s*\\d+\\b/;          // sets score 2:0 / 1-2
-          const rxSet = /\\b\\d+\\s+\\d+\\b/;                      // current game points like "30 15" or "6 3"
-          const rxFinished = /(Закончил|Finished|FT|ПВ)/i;
-          const as = Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"]'));
-          const out = [];
-          for (const a of as) {
-            const href = a.getAttribute('href') || '';\n            if (!href) continue;\n            const txt = norm(a.innerText || a.textContent || '');\n            const likely = rxFinished.test(txt) || rxScore.test(txt) || rxSet.test(txt);\n            out.push({href, likely});\n          }\n          // Stable-ish: likely finished first, then as-is.\n          out.sort((x,y) => (y.likely?1:0) - (x.likely?1:0));\n          return out.map(x => x.href);\n        }\n        """
-    )
+    # Scroll and accumulate links across virtualized chunks.
+    hrefs_acc: List[str] = []
+    seen_local: set = set()
+    stalled = 0
+    max_scroll_rounds = max(24, min(120, int(limit) // 3))
+    for _ in range(max_scroll_rounds):
+        try:
+            hrefs_chunk: List[str] = await page.evaluate(
+                """
+                () => {
+                  function norm(s){return (s||'').replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g,' ').replace(/\\s+/g,' ').trim();}
+                  const rxScore = /\\b\\d+\\s*[:\\-]\\s*\\d+\\b/;          // sets score 2:0 / 1-2
+                  const rxSet = /\\b\\d+\\s+\\d+\\b/;                      // current game points like "30 15" or "6 3"
+                  const rxFinished = /(Закончил|Finished|FT|ПВ)/i;
+                  const as = Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"]'));
+                  const out = [];
+                  for (const a of as) {
+                    const href = a.getAttribute('href') || '';
+                    if (!href) continue;
+                    const txt = norm(a.innerText || a.textContent || '');
+                    const likely = rxFinished.test(txt) || rxScore.test(txt) || rxSet.test(txt);
+                    out.push({href, likely});
+                  }
+                  // Stable-ish: likely finished first, then as-is.
+                  out.sort((x,y) => (y.likely?1:0) - (x.likely?1:0));
+                  return out.map(x => x.href);
+                }
+                """
+            )
+        except Exception:
+            hrefs_chunk = []
+        added = 0
+        for href in hrefs_chunk or []:
+            if not isinstance(href, str) or not href:
+                continue
+            if href in seen_local:
+                continue
+            seen_local.add(href)
+            hrefs_acc.append(href)
+            added += 1
+            if len(hrefs_acc) >= int(limit):
+                break
+        if len(hrefs_acc) >= int(limit):
+            break
+        if added == 0:
+            stalled += 1
+        else:
+            stalled = 0
+        if stalled >= 8 and len(hrefs_acc) >= max(20, int(limit) // 4):
+            break
+        try:
+            await page.mouse.wheel(0, 1700)
+            await page.wait_for_timeout(320)
+        except Exception:
+            break
+    hrefs: List[str] = hrefs_acc
     out: List[str] = []
     seen: set = set()
     for href in hrefs:
-        if href.startswith("http"):
-            full = href
-        else:
-            full = "https://www.sofascore.com" + href
+        full = _normalize_sofascore_url(href)
         if "/tennis/match/" not in full:
             continue
         # Keep fragment "#id:<eventId>" if present.
@@ -817,6 +872,8 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
         pass
     # Scroll to load more cards until we reach expected count (or stop growing).
     hrefs: List[str] = []
+    seen_hrefs: set = set()
+    collected_hrefs: List[str] = []
     try:
         prev = 0
         stalled = 0
@@ -885,16 +942,25 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
                     }}
                     return null;
                   }}
-                  const root = findRoot() || document;
-                  return Array.from(root.querySelectorAll({sel!r}))
+                  // IMPORTANT: collect from whole document, not only one detected container.
+                  // Sofascore can render lower leagues in separate blocks; root-only query misses them.
+                  return Array.from(document.querySelectorAll({sel!r}))
                     .filter(isVisible)
                     .map(a => a.getAttribute('href'))
                     .filter(Boolean);
                 }}
                 """
             )
+            if isinstance(hrefs, list):
+                for h in hrefs:
+                    if not isinstance(h, str) or not h:
+                        continue
+                    if h in seen_hrefs:
+                        continue
+                    seen_hrefs.add(h)
+                    collected_hrefs.append(h)
             # Preserve DOM order but dedupe by appearance.
-            cur = len({h for h in hrefs if isinstance(h, str)})
+            cur = len(collected_hrefs)
             if target is not None and cur >= target:
                 break
             if cur <= prev and cur > 0:
@@ -938,35 +1004,35 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
             # Scroll the live list container if possible, else window.
             try:
                 await page.evaluate(
-                    """
-                    () => {
-                      const want = /^(Сейчас|Live)\\s*\\(\\d+\\)\\s*$/i;
+                    f"""
+                    () => {{
+                      const want = {want_js};
                       const candidates = Array.from(document.querySelectorAll('button')).filter(b => want.test((b.innerText||b.textContent||'').trim()));
                       let liveBtn = null;
-                      for (const b of candidates) {
+                      for (const b of candidates) {{
                         const p = (b.parentElement && (b.parentElement.innerText || b.parentElement.textContent) || '').toLowerCase();
-                        if ((p.includes('законч') || p.includes('finished')) && (p.includes('предстоящ') || p.includes('upcoming'))) {
+                        if ({row_cond_js}) {{
                           liveBtn = b; break;
-                        }
-                      }
-                      if (!liveBtn) {
+                        }}
+                      }}
+                      if (!liveBtn) {{
                         liveBtn = Array.from(document.querySelectorAll('button[aria-selected="true"]')).find(b => want.test((b.innerText||b.textContent||'').trim())) || candidates[0] || null;
-                      }
+                      }}
                       let root = null;
-                      if (liveBtn) {
+                      if (liveBtn) {{
                         let cur = liveBtn.parentElement;
-                        while (cur) {
+                        while (cur) {{
                           const n = cur.querySelectorAll('a[href*="/tennis/match/"][href*="#id:"]').length;
-                          if (n >= 5) { root = cur; break; }
+                          if (n >= 5) {{ root = cur; break; }}
                           cur = cur.parentElement;
-                        }
-                      }
-                      if (root && root.scrollHeight > root.clientHeight) {
+                        }}
+                      }}
+                      if (root && root.scrollHeight > root.clientHeight) {{
                         root.scrollBy(0, Math.max(800, root.clientHeight * 0.9));
-                        return;
-                      }
+                      }}
+                      // Also move the page itself: some lower-tier blocks are outside the tab-local container.
                       window.scrollBy(0, Math.max(800, window.innerHeight * 0.9));
-                    }
+                    }}
                     """
                 )
             except Exception:
@@ -979,13 +1045,22 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
         hrefs = await page.evaluate(
             """() => Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"][href*=\"#id:\"]'))\n              .map(a => a.getAttribute('href'))\n              .filter(Boolean)"""
         )
+        if isinstance(hrefs, list):
+            for h in hrefs:
+                if not isinstance(h, str) or not h:
+                    continue
+                if h in seen_hrefs:
+                    continue
+                seen_hrefs.add(h)
+                collected_hrefs.append(h)
     seen: set = set()
     out: List[str] = []
-    for href in hrefs:
+    source_hrefs = collected_hrefs if collected_hrefs else [h for h in hrefs if isinstance(h, str)]
+    for href in source_hrefs:
         if href in seen:
             continue
         seen.add(href)
-        out.append("https://www.sofascore.com" + href)
+        out.append(_normalize_sofascore_url(href))
         # If limit is not specified, use expected count from "Сейчас (N)".
         lim = limit
         if lim is None and expected_n is not None:
@@ -998,7 +1073,7 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
     if os.getenv("THIRDSET_DEBUG_LIVE") in ("1", "true", "yes"):
         try:
             print(
-                f"[live-dom] chosen={chosen_label!r} expected_n={expected_n} out={len(out)} limit={limit}",
+                f"[match-dom tab={tab}] chosen={chosen_label!r} expected_n={expected_n} out={len(out)} limit={limit}",
                 flush=True,
             )
         except Exception:
@@ -1014,6 +1089,26 @@ def parse_event_id_from_match_link(url: str) -> Optional[int]:
         return int(url.split(marker, 1)[1])
     except Exception:
         return None
+
+
+def _names_from_match_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        m = re.search(r"/tennis/match/([^/]+)/[^/?#]+", str(url or ""))
+        if not m:
+            return None, None
+        slug = m.group(1)
+        parts = [p for p in str(slug).split("-") if p]
+        if len(parts) < 2:
+            return None, None
+        # Sofascore slugs are typically "<name2>-<name1>"; we keep display only as fallback.
+        half = max(1, len(parts) // 2)
+        a = " ".join(parts[:half]).strip()
+        b = " ".join(parts[half:]).strip()
+        def _cap(s: str) -> str:
+            return " ".join(x[:1].upper() + x[1:] for x in s.split())
+        return (_cap(a) if a else None, _cap(b) if b else None)
+    except Exception:
+        return None, None
 
 
 async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1105,9 +1200,10 @@ async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) ->
                 const href = a.getAttribute('href') || '';
                 const urlAbs = a.href || (location.origin + href);
                 const url = urlAbs.split('#')[0];
+                const raw = norm(a.innerText || a.textContent || '');
                 let home = null;
                 let away = null;
-                const rawLines = (a.innerText || a.textContent || '').split('\\n').map(norm).filter(Boolean);
+                const rawLines = raw.split('\\n').map(norm).filter(Boolean);
                 const nameLines = rawLines
                   .filter(t => /[A-Za-zА-Яа-яЁё]/.test(t))
                   .filter(t => !/^\\d{1,2}:\\d{2}$/.test(t))
@@ -1136,13 +1232,28 @@ async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) ->
     if not isinstance(cards, list):
         return []
     out: List[Dict[str, Any]] = []
+    out_ids: set = set()
     for c in cards:
         if not isinstance(c, dict):
             continue
         eid = c.get("id")
         if not isinstance(eid, int) or eid not in allowed_set:
             continue
-        out.append(c)
+        row = dict(c)
+        # Fill names from URL slug as a weak fallback.
+        if not (row.get("home") and row.get("away")):
+            h0, a0 = _names_from_match_url(str(row.get("url") or ""))
+            if h0 and not row.get("home"):
+                row["home"] = h0
+            if a0 and not row.get("away"):
+                row["away"] = a0
+        # For TG "Список live" we intentionally mirror the selected DOM tab.
+        # Do not re-filter by API status here; DOM tab selection is the source of truth.
+        row["status"] = str(row.get("status") or "dom_live")
+        if eid in out_ids:
+            continue
+        out_ids.add(eid)
+        out.append(row)
     return out
 
 
@@ -1163,6 +1274,8 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
         if isinstance(eid, int):
             allowed_ids.append(eid)
             allowed_set.add(eid)
+    if not allowed_ids:
+        return []
 
     try:
         # Reuse the same extractor as live cards: it looks for anchors with "#id:<eventId>" and pulls the surrounding text.
@@ -1195,9 +1308,10 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
                 const href = a.getAttribute('href') || '';
                 const urlAbs = a.href || (location.origin + href);
                 const url = urlAbs.split('#')[0];
+                const raw = norm(a.innerText || a.textContent || '');
                 let home = null;
                 let away = null;
-                const rawLines = (a.innerText || a.textContent || '').split('\\n').map(norm).filter(Boolean);
+                const rawLines = raw.split('\\n').map(norm).filter(Boolean);
                 const nameLines = rawLines
                   .filter(t => /[A-Za-zА-Яа-яЁё]/.test(t))
                   .filter(t => !/^\\d{1,2}:\\d{2}$/.test(t))
@@ -1213,7 +1327,7 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
                   a.querySelector('div[class*=\"ai_flex-end\"][class*=\"flex-d_column\"]') ||
                   null;
                 const score = scoreRoot ? norm(scoreRoot.textContent) : null;
-                res.push({ id, url, home, away, score });
+                res.push({ id, url, home, away, score, raw });
               }
               return res;
             }
@@ -1224,14 +1338,55 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
         cards = []
     if not isinstance(cards, list):
         return []
+    # Try to enrich cards with canonical fields from event API, but do not drop DOM cards on failures.
+    verified_by_id: Dict[int, Dict[str, Any]] = {}
+    for eid in allowed_ids:
+        try:
+            payload = await get_event_via_navigation(page, int(eid), timeout_ms=8_000)
+            ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+            if not isinstance(ev, dict) or not ev:
+                continue
+            verified_by_id[int(eid)] = {
+                "status": str(((ev.get("status") or {}).get("type")) or "").lower() or None,
+                "startTimestamp": ev.get("startTimestamp"),
+                "defaultPeriodCount": ev.get("defaultPeriodCount"),
+                "isSingles": bool(is_singles_event(ev)),
+                "slug": ev.get("slug"),
+                "customId": ev.get("customId"),
+                "homeName": str(((ev.get("homeTeam") or {}).get("name")) or "") or None,
+                "awayName": str(((ev.get("awayTeam") or {}).get("name")) or "") or None,
+                "homeId": (ev.get("homeTeam") or {}).get("id"),
+                "awayId": (ev.get("awayTeam") or {}).get("id"),
+                "homeSlug": (ev.get("homeTeam") or {}).get("slug"),
+                "awaySlug": (ev.get("awayTeam") or {}).get("slug"),
+            }
+        except Exception:
+            continue
     out: List[Dict[str, Any]] = []
+    seen_ids: set = set()
     for c in cards:
         if not isinstance(c, dict):
             continue
         eid = c.get("id")
         if not isinstance(eid, int) or eid not in allowed_set:
             continue
-        out.append(c)
+        if int(eid) in seen_ids:
+            continue
+        extra = verified_by_id.get(int(eid), {})
+        row = dict(c)
+        # DOM cards are the source of truth for "what user sees"; API fields are optional enrichment.
+        if "status" not in row:
+            row["status"] = None
+        if "startTimestamp" not in row:
+            row["startTimestamp"] = None
+        if "isSingles" not in row:
+            row["isSingles"] = None
+        row["enriched"] = False
+        if isinstance(extra, dict):
+            row.update(extra)
+            row["enriched"] = True
+        seen_ids.add(int(eid))
+        out.append(row)
     return out
 
 async def get_event_from_match_url_via_navigation(

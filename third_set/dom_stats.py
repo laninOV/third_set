@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,7 +11,36 @@ from third_set.browser_utils import clear_browser_cache, disable_network_cache, 
 
 
 class DomStatsError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        step: Optional[str] = None,
+        code: Optional[str] = None,
+        attempt: Optional[int] = None,
+        diag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.step = step
+        self.code = code
+        self.attempt = attempt
+        self.diag = diag or {}
+        super().__init__(message)
+
+
+def _dom_err(
+    *,
+    step: str,
+    code: str,
+    message: str,
+    attempt: Optional[int] = None,
+    diag: Optional[Dict[str, Any]] = None,
+) -> DomStatsError:
+    parts = [f"step={step}", f"code={code}"]
+    if isinstance(attempt, int):
+        parts.append(f"attempt={attempt}")
+    if message:
+        parts.append(message)
+    return DomStatsError(" ".join(parts), step=step, code=code, attempt=attempt, diag=(diag or {}))
 
 
 try:
@@ -21,11 +51,26 @@ try:
     _UI_TIMEOUT_MS = int(os.getenv("THIRDSET_UI_TIMEOUT_MS", "10000"))
 except Exception:
     _UI_TIMEOUT_MS = 10_000
+try:
+    _SLOW_LOAD_MS = int(os.getenv("THIRDSET_SLOW_LOAD_MS", "0"))
+except Exception:
+    _SLOW_LOAD_MS = 0
+try:
+    _WAIT_STATS_MS = int(os.getenv("THIRDSET_WAIT_STATS_MS", "0"))
+except Exception:
+    _WAIT_STATS_MS = 0
+try:
+    _HUMAN_PAUSE_MS = int(os.getenv("THIRDSET_HUMAN_PAUSE_MS", "0"))
+except Exception:
+    _HUMAN_PAUSE_MS = 0
 
 
 def _dbg(msg: str) -> None:
     if os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes"):
         print(f"[dom] {msg}", flush=True)
+
+
+_NO_LIMITS_MODE = os.getenv("THIRDSET_NO_LIMITS", "1").strip().lower() not in ("0", "false", "no")
 
 
 async def _safe_goto(page: Page, url: str, *, timeout_ms: int) -> None:
@@ -165,6 +210,112 @@ async def _is_cloudflare_block(page: Page) -> bool:
     return False
 
 
+async def _wait_for_stats_rows(page: Page, *, timeout_ms: int) -> bool:
+    """
+    Wait until stats rows (or headers) are present in DOM.
+    This avoids scraping too early when the tab is visible but data is still loading.
+    """
+    try:
+        await page.wait_for_function(
+            """
+            () => {
+              const root = document.querySelector('#tabpanel-statistics') || document;
+              const rows = root.querySelectorAll(
+                'div.d_flex.ai_center.jc_space-between, div.d_flex.jc_space-between, div.jc_space-between, div[class*="statisticsRow"], div[class*="statRow"]'
+              ).length;
+              const headers = root.querySelectorAll('span[class*="textStyle_display"]').length;
+              return rows >= 2 || headers >= 2;
+            }
+            """,
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _wait_page_ready(page: Page, *, timeout_ms: int) -> None:
+    """
+    Wait for page hydration before interacting with tabs/stats.
+    Sofascore often finishes DOMContentLoaded early while tab controls are still mounting.
+    """
+    t = max(1500, int(timeout_ms))
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=min(t, 8_000))
+    except Exception:
+        pass
+    try:
+        await page.wait_for_function("() => document.readyState === 'complete'", timeout=min(t, 10_000))
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=min(t, 8_000))
+    except Exception:
+        pass
+    # Small settle time to let async widgets mount.
+    try:
+        await page.wait_for_timeout(450)
+    except Exception:
+        pass
+
+
+def _period_text_markers(period_code: str) -> List[str]:
+    code = (period_code or "").upper()
+    if code == "ALL":
+        return ["all", "все", "вcе"]
+    if code == "1ST":
+        return ["1st", "1-й", "1"]
+    if code == "2ND":
+        return ["2nd", "2-й", "2"]
+    if code == "3RD":
+        return ["3rd", "3-й", "3"]
+    return []
+
+
+async def _wait_period_selected(page: Page, *, period_code: str, timeout_ms: int) -> bool:
+    """
+    Best-effort check that the requested period control is selected/active.
+    Sofascore changes markup often, so we treat this as advisory and keep stats rows
+    as the primary readiness signal.
+    """
+    markers = _period_text_markers(period_code)
+    if not markers:
+        return False
+    try:
+        await page.wait_for_function(
+            """
+            (arg) => {
+              const marks = (arg?.markers || []).map((x) => String(x || '').toLowerCase());
+              if (!marks.length) return false;
+              const root = document.querySelector('#tabpanel-statistics') || document;
+              const controls = Array.from(
+                root.querySelectorAll(
+                  'button, a, [role="tab"], [role="button"], [aria-selected], [aria-pressed], [class*="button"]'
+                )
+              );
+              const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              for (const el of controls) {
+                const txt = norm(el.innerText || el.textContent || '');
+                if (!txt) continue;
+                const hit = marks.some((m) => txt === m || txt.startsWith(m) || txt.includes(m));
+                if (!hit) continue;
+                const ariaSel = String(el.getAttribute('aria-selected') || '').toLowerCase();
+                const ariaPressed = String(el.getAttribute('aria-pressed') || '').toLowerCase();
+                const cls = norm(el.className || '');
+                if (ariaSel === 'true' || ariaPressed === 'true') return true;
+                if (cls.includes('variant_filled') || cls.includes('active') || cls.includes('selected')) return true;
+              }
+              return false;
+            }
+            """,
+            {"markers": markers},
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def _dismiss_overlays(page: Page) -> None:
     _dbg("dismiss_overlays")
     try:
@@ -294,7 +445,8 @@ async def _dismiss_overlays(page: Page) -> None:
         pass
 
 
-async def _click_statistics_tab(page: Page) -> None:
+async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
+    await _wait_page_ready(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms + 4_000)
     await _dismiss_overlays(page)
     if await _is_cloudflare_block(page):
         raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
@@ -324,6 +476,9 @@ async def _click_statistics_tab(page: Page) -> None:
                     if await tab.count():
                         await tab.first.click(timeout=_UI_TIMEOUT_MS, force=True)
                         await page.wait_for_timeout(500)
+                        ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+                        if not ok:
+                            raise DomStatsError("step=statistics_tab: stats rows not ready after tab click")
                         return
         except Exception:
             pass
@@ -347,6 +502,9 @@ async def _click_statistics_tab(page: Page) -> None:
                         continue
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
                     await page.wait_for_timeout(500)
+                    ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+                    if not ok:
+                        raise DomStatsError("step=statistics_tab: stats rows not ready after role click")
                     return
                 except Exception:
                     continue
@@ -356,6 +514,9 @@ async def _click_statistics_tab(page: Page) -> None:
                 if await loc.count():
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
                     await page.wait_for_timeout(500)
+                    ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+                    if not ok:
+                        raise DomStatsError("step=statistics_tab: stats rows not ready after css click")
                     return
             except Exception:
                 pass
@@ -380,6 +541,10 @@ async def _click_statistics_tab(page: Page) -> None:
         )
         if clicked:
             await page.wait_for_timeout(500)
+            # Give the stats block time to hydrate.
+            ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+            if not ok:
+                raise DomStatsError("step=statistics_tab: stats rows not ready after dom click")
             return
     except Exception:
         pass
@@ -398,8 +563,14 @@ async def _click_statistics_tab(page: Page) -> None:
         if clicked:
             await page.wait_for_timeout(700)
             if await page.locator("#tabpanel-statistics").count():
+                ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+                if not ok:
+                    raise DomStatsError("step=statistics_tab: stats rows not ready after js hash tab")
                 return
             # Even if tabpanel id is missing, allow the extractor to continue (it falls back to document root).
+            ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+            if not ok:
+                raise DomStatsError("step=statistics_tab: stats rows not ready after js href tab")
             return
     except Exception:
         pass
@@ -421,13 +592,17 @@ async def _click_statistics_tab(page: Page) -> None:
         tabpanel = page.locator("#tabpanel-statistics")
         # Do not require "visible": consent overlays can affect visibility checks.
         if await tabpanel.count():
+            # Wait for content to populate.
+            ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+            if not ok:
+                raise DomStatsError("step=statistics_tab: stats rows not ready after location hash")
             return
     except Exception:
         pass
     raise DomStatsError("Не удалось открыть вкладку 'Статистика' (DOM)")
 
 
-async def _select_period(page: Page, period_code: str) -> bool:
+async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) -> bool:
     await _dismiss_overlays(page)
     if await _is_cloudflare_block(page):
         raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
@@ -473,6 +648,18 @@ async def _select_period(page: Page, period_code: str) -> bool:
     roots.append(page)
 
     patterns = rx_for(period_code)
+    if not patterns:
+        raise DomStatsError(f"step=period_select:{period_code}: unsupported period code")
+
+    async def _after_click() -> bool:
+        await page.wait_for_timeout(250 + max(0, _SLOW_LOAD_MS // 8))
+        selected = await _wait_period_selected(page, period_code=period_code, timeout_ms=min(4500, _UI_TIMEOUT_MS + 2000))
+        ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+        if not ok:
+            raise DomStatsError(f"step=period_select:{period_code}: stats rows not ready")
+        if not selected:
+            _dbg(f"period {period_code}: active marker not observed; proceeding by rows readiness")
+        return True
 
     async def try_click_within(root) -> bool:
         # 1) role=tab / role=button with regex name
@@ -482,8 +669,7 @@ async def _select_period(page: Page, period_code: str) -> bool:
                     loc = root.get_by_role(kind, name=rx)
                     if await loc.count():
                         await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                        await page.wait_for_timeout(250)
-                        return True
+                        return await _after_click()
                 except Exception:
                     continue
         # 2) plain buttons/tabs filtered by text
@@ -492,8 +678,7 @@ async def _select_period(page: Page, period_code: str) -> bool:
                 loc = root.locator("button, a, [role='tab'], [role='button'], [role='link']").filter(has_text=rx)
                 if await loc.count():
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                    await page.wait_for_timeout(250)
-                    return True
+                    return await _after_click()
             except Exception:
                 continue
         # 3) any text node (click nearest clickable parent)
@@ -512,8 +697,7 @@ async def _select_period(page: Page, period_code: str) -> bool:
                         await parent.click(timeout=_UI_TIMEOUT_MS, force=True)
                     except Exception:
                         continue
-                await page.wait_for_timeout(250)
-                return True
+                return await _after_click()
             except Exception:
                 continue
         # 4) JS fallback: click any element whose visible text matches.
@@ -546,8 +730,7 @@ async def _select_period(page: Page, period_code: str) -> bool:
                 {"patterns": [p.pattern for p in patterns]},
             )
             if clicked:
-                await page.wait_for_timeout(250)
-                return True
+                return await _after_click()
         except Exception:
             pass
         return False
@@ -637,8 +820,7 @@ async def _select_period(page: Page, period_code: str) -> bool:
                                 except Exception:
                                     pass
                                 await o.click(timeout=_UI_TIMEOUT_MS, force=True)
-                                await page.wait_for_timeout(250)
-                                return True
+                                return await _after_click()
                         except Exception:
                             continue
                 # If the menu opened but we didn't find the option, close it and try next.
@@ -658,6 +840,7 @@ async def extract_statistics_dom(
     event_id: int,
     periods: Tuple[str, ...] = ("1ST", "2ND"),
     nav_timeout_ms: Optional[int] = None,
+    wait_stats_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Extract per-period tennis statistics from Sofascore DOM ("Статистика" tab).
@@ -669,7 +852,22 @@ async def extract_statistics_dom(
     # Sofascore can redirect between locales (e.g. /ru/ -> /en-us/), so we match by the
     # locale-independent path `/tennis/match/<slug>/<customId>` rather than full prefix.
     target = match_url + f"#id:{event_id}"
+    started_at = asyncio.get_running_loop().time()
     nav_timeout = int(nav_timeout_ms) if isinstance(nav_timeout_ms, int) and nav_timeout_ms > 0 else _NAV_TIMEOUT_MS
+    try:
+        step_retries = int(os.getenv("THIRDSET_DOM_STEP_RETRIES") or "2")
+    except Exception:
+        step_retries = 2
+    step_retries = max(0, min(6, step_retries))
+    try:
+        step_backoff_ms = int(os.getenv("THIRDSET_DOM_STEP_BACKOFF_MS") or "350")
+    except Exception:
+        step_backoff_ms = 350
+    step_backoff_ms = max(50, min(5000, step_backoff_ms))
+    varnish_seen = False
+
+    def _elapsed_ms() -> int:
+        return int(max(0.0, asyncio.get_running_loop().time() - started_at) * 1000.0)
 
     def _match_identity(url: str) -> str:
         try:
@@ -687,39 +885,60 @@ async def extract_statistics_dom(
     if not on_same_match or not has_event_fragment:
         _dbg(f"goto {target}")
         last_err: Optional[Exception] = None
-        for attempt in range(4):
+        for attempt in range(step_retries + 1):
             try:
                 await _safe_goto(page, target, timeout_ms=nav_timeout)
-                # Avoid waiting for networkidle here: Sofascore keeps background requests alive.
                 try:
                     await page.wait_for_load_state("domcontentloaded", timeout=4_000)
                 except Exception:
                     pass
-                # Small settle to let the tab strip and stats hydrate.
                 await page.wait_for_timeout(250)
+                if _HUMAN_PAUSE_MS > 0:
+                    await page.wait_for_timeout(_HUMAN_PAUSE_MS)
                 if await _is_varnish_503(page):
-                    # transient backend cache error; wait and retry
-                    wait_ms = 800 * (attempt + 1)
-                    _dbg(f"varnish_503: retry in {wait_ms}ms (attempt {attempt+1}/4)")
+                    varnish_seen = True
+                    wait_ms = step_backoff_ms * (attempt + 1)
+                    _dbg(f"varnish_503: retry in {wait_ms}ms (attempt {attempt+1}/{step_retries+1})")
+                    if attempt >= step_retries:
+                        raise _dom_err(
+                            step="goto_match",
+                            code="varnish_503",
+                            attempt=attempt + 1,
+                            message="Sofascore 503 backend read error (Varnish)",
+                            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": True},
+                        )
                     await page.wait_for_timeout(wait_ms)
                     continue
                 last_err = None
                 break
+            except DomStatsError:
+                raise
             except Exception as ex:
                 last_err = ex
-                # If we timed out but the URL already matches, continue with DOM scraping.
                 have_id = _match_identity(page.url or "")
                 if want_id and have_id == want_id:
                     last_err = None
                     break
-                # short backoff and retry
-                await page.wait_for_timeout(700 * (attempt + 1))
+                if attempt >= step_retries:
+                    raise _dom_err(
+                        step="goto_match",
+                        code="navigation_failed",
+                        attempt=attempt + 1,
+                        message=f"{type(ex).__name__}: {ex}",
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    ) from ex
+                await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
                 continue
         if last_err is not None:
-            raise last_err
+            raise _dom_err(
+                step="goto_match",
+                code="navigation_failed",
+                message=f"{type(last_err).__name__}: {last_err}",
+                diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+            ) from last_err
     else:
-        # Even if we think we're on the same match, Sofascore might have returned a 503 page.
         if await _is_varnish_503(page):
+            varnish_seen = True
             _dbg("varnish_503 on same match; reloading")
             await _safe_goto(page, target, timeout_ms=nav_timeout)
             try:
@@ -727,21 +946,70 @@ async def extract_statistics_dom(
             except Exception:
                 pass
             await page.wait_for_timeout(250)
+            if _HUMAN_PAUSE_MS > 0:
+                await page.wait_for_timeout(_HUMAN_PAUSE_MS)
             if await _is_varnish_503(page):
-                raise DomStatsError("Sofascore 503 backend read error (Varnish)")
+                raise _dom_err(
+                    step="goto_match",
+                    code="varnish_503",
+                    message="Sofascore 503 backend read error (Varnish)",
+                    diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": True},
+                )
 
     if await _is_cloudflare_block(page):
-        raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
+        raise _dom_err(
+            step="dismiss_overlays",
+            code="cloudflare_block",
+            message="Cloudflare блокирует страницу (нужно реальное окно/куки)",
+            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+        )
 
-    await _dismiss_overlays(page)
     try:
-        await _click_statistics_tab(page)
-    except DomStatsError as e:
-        # Some layouts render the statistics block without an explicit "Статистика" tab
-        # (or the tab is hidden behind responsive UI). If the stats rows exist in DOM,
-        # scraping can still succeed, so don't hard-fail here.
-        _dbg(f"click_statistics_tab skipped: {e}")
-    await page.wait_for_timeout(600)
+        await _dismiss_overlays(page)
+    except Exception as ex:
+        raise _dom_err(
+            step="dismiss_overlays",
+            code="overlay_blocked",
+            message=f"{type(ex).__name__}: {ex}",
+            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+        ) from ex
+    wait_stats = int(wait_stats_ms) if isinstance(wait_stats_ms, int) and wait_stats_ms > 0 else _WAIT_STATS_MS
+    stats_opened = False
+    open_err: Optional[Exception] = None
+    for attempt in range(step_retries + 1):
+        try:
+            await _click_statistics_tab(page, wait_stats_ms=wait_stats)
+            await page.wait_for_timeout(600 + max(0, _SLOW_LOAD_MS) + max(0, wait_stats // 2))
+            ok_rows = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats)
+            if not ok_rows:
+                raise _dom_err(
+                    step="open_statistics_tab",
+                    code="rows_not_ready",
+                    attempt=attempt + 1,
+                    message="statistics rows not ready after tab open",
+                    diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                )
+            stats_opened = True
+            open_err = None
+            break
+        except DomStatsError as ex:
+            open_err = ex
+            if attempt >= step_retries:
+                break
+            await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
+        except Exception as ex:
+            open_err = ex
+            if attempt >= step_retries:
+                break
+            await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
+    if not stats_opened:
+        msg = f"{type(open_err).__name__}: {open_err}" if open_err is not None else "statistics tab not reachable"
+        raise _dom_err(
+            step="open_statistics_tab",
+            code="statistics_tab_unreachable",
+            message=msg,
+            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+        ) from open_err
 
     try:
         await disable_network_cache(page)
@@ -811,8 +1079,10 @@ async def extract_statistics_dom(
 
     async def scrape_current_view() -> List[Dict[str, Any]]:
         _dbg("scrape_current_view evaluate()")
-        return await page.evaluate(
-            """
+        eval_timeout_s = max(6.0, float((_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats) / 1000.0))
+        if _NO_LIMITS_MODE:
+            return await page.evaluate(
+                """
             () => {
               const root = document.querySelector('#tabpanel-statistics') || document;
 
@@ -952,22 +1222,224 @@ async def extract_statistics_dom(
               return groups;
             }
             """
+            )
+        return await asyncio.wait_for(
+            page.evaluate(
+                """
+            () => {
+              const root = document.querySelector('#tabpanel-statistics') || document;
+
+              function normText(s) {
+                // Be tolerant to NBSP/zero-width and other layout chars.
+                return (s || '')
+                  .replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g, ' ')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
+              }
+
+              function canonGroup(s) {
+                const t = normText(s).toLowerCase();
+                if (!t) return null;
+                // RU
+                if (/^подача\\b/.test(t)) return 'Подача';
+                if (/^очки\\b/.test(t)) return 'Очки';
+                if (/^(возврат|при[её]м)\\b/.test(t)) return 'Возврат';
+                if (/^(игр|игры|геймы|гейм)\\b/.test(t)) return 'Игр';
+                if (/^(разное|прочее)\\b/.test(t)) return 'Разное';
+                // EN
+                if (/^service\\b/.test(t)) return 'Service';
+                if (/^points\\b/.test(t)) return 'Points';
+                if (/^return\\b/.test(t)) return 'Return';
+                if (/^games?\\b/.test(t)) return 'Games';
+                if (/^(miscellaneous|misc)\\b/.test(t)) return 'Miscellaneous';
+                return null;
+              }
+
+              function rectOf(el) {
+                try {
+                  const r = el.getBoundingClientRect();
+                  if (!r) return null;
+                  return {
+                    x: r.left + window.scrollX,
+                    y: r.top + window.scrollY,
+                    w: r.width,
+                    h: r.height,
+                    cx: r.left + window.scrollX + r.width / 2,
+                  };
+                } catch (e) {
+                  return null;
+                }
+              }
+
+              let headerEls = Array.from(root.querySelectorAll('span[class*=\"textStyle_display\"]'))
+                .map((el) => ({ el, t: canonGroup(el.textContent), r: rectOf(el) }))
+                .filter((x) => x.t && x.r && typeof x.r.y === 'number');
+              if (!headerEls.length) {
+                headerEls = Array.from(root.querySelectorAll('h1,h2,h3,h4,span,div,p'))
+                  .map((el) => ({ el, t: canonGroup(el.textContent), r: rectOf(el) }))
+                  .filter((x) => x.t && x.r && typeof x.r.y === 'number');
+              }
+              headerEls.sort((a,b) => (a.r.y - b.r.y) || (a.r.cx - b.r.cx));
+
+              const rowSel = [
+                'div.d_flex.ai_center.jc_space-between',
+                'div.d_flex.jc_space-between',
+                'div.jc_space-between',
+                'div[class*=\"statisticsRow\"]',
+                'div[class*=\"statRow\"]'
+              ].join(',');
+              const rowsAll = Array.from(root.querySelectorAll(rowSel))
+                .map((el) => ({ el, r: rectOf(el) }))
+                .filter((x) => x.r && typeof x.r.y === 'number')
+                .sort((a,b) => (a.r.y - b.r.y) || (a.r.cx - b.r.cx));
+
+              function parseRow(rowEl) {
+                const bdis = Array.from(rowEl.querySelectorAll('bdi'));
+                let left = null;
+                let right = null;
+                if (bdis.length >= 2) {
+                  left = bdis[0];
+                  right = bdis[bdis.length - 1];
+                }
+                if (!left || !right) {
+                  const nodes = Array.from(rowEl.querySelectorAll('span,div,p,strong,b'))
+                    .map((el) => ({ el, t: normText(el.textContent) }))
+                    .filter((x) => x.t);
+                  const numeric = nodes.filter((x) => /^\\d+(?:\\s*\\/\\s*\\d+)?(?:\\s*\\(\\d+%\\))?$/.test(x.t));
+                  if (numeric.length >= 2) {
+                    left = numeric[0].el;
+                    right = numeric[numeric.length - 1].el;
+                  }
+                }
+                let label =
+                  rowEl.querySelector('span[class*=\"textStyle_assistive\"]') ||
+                  rowEl.querySelector('p[class*=\"textStyle_assistive\"]') ||
+                  rowEl.querySelector('div[class*=\"textStyle_assistive\"]') ||
+                  null;
+                if (!label) {
+                  const cands = Array.from(rowEl.querySelectorAll('span,div,p'))
+                    .map((el) => normText(el.textContent))
+                    .filter((t) => t && !/^\\d+(?:\\s*\\/\\s*\\d+)?(?:\\s*\\(\\d+%\\))?$/.test(t));
+                  if (cands.length) label = { textContent: cands[Math.floor(cands.length/2)] };
+                }
+                const labelText = normText(label && (label.textContent || label.innerText || ''));
+                if (!labelText) return null;
+                const lv = normText(left && (left.textContent || left.innerText || ''));
+                const rv = normText(right && (right.textContent || right.innerText || ''));
+                if (!lv || !rv) return null;
+                return { label: labelText, home: lv, away: rv };
+              }
+
+              function nearestGroupForRow(rowRect) {
+                if (!rowRect || !headerEls.length) return null;
+                let best = null;
+                for (const h of headerEls) {
+                  if (h.r.y > rowRect.y) break;
+                  const dy = rowRect.y - h.r.y;
+                  const dx = Math.abs(rowRect.cx - h.r.cx);
+                  const score = dy * 1.0 + dx * 0.15;
+                  if (!best || score < best.score) best = { t: h.t, score };
+                }
+                return best ? best.t : null;
+              }
+
+              const byGroup = new Map();
+              for (const row of rowsAll) {
+                const parsed = parseRow(row.el);
+                if (!parsed) continue;
+                const g = nearestGroupForRow(row.r);
+                if (!g) continue;
+                const it = { label: parsed.label, home: parsed.home, away: parsed.away };
+                if (!byGroup.has(g)) byGroup.set(g, []);
+                byGroup.get(g).push(it);
+              }
+
+              const groups = [];
+              for (const [title, items] of byGroup.entries()) {
+                if (items && items.length) groups.push({ title, items });
+              }
+              return groups;
+            }
+            """
+            ),
+            timeout=eval_timeout_s,
         )
 
     out_periods: List[Dict[str, Any]] = []
     meta_seen: Dict[str, Any] = {}
     meta_unmapped: Dict[str, Any] = {}
     for per in periods:
-        ok = await _select_period(page, per)
-        if not ok:
-            continue
-        _dbg(f"period {per}: selected")
-        try:
-            await page.wait_for_selector("div.d_flex.ai_center.jc_space-between", timeout=_UI_TIMEOUT_MS)
-        except Exception:
-            pass
-        await page.wait_for_timeout(350)
-        groups_raw = await scrape_current_view()
+        groups_raw: List[Dict[str, Any]] = []
+        selected = False
+        select_err: Optional[Exception] = None
+        for attempt in range(step_retries + 1):
+            try:
+                selected = await _select_period(page, per, wait_stats_ms=wait_stats)
+                if not selected:
+                    raise _dom_err(
+                        step=f"select_period_{per.lower()}",
+                        code="period_select_failed",
+                        attempt=attempt + 1,
+                        message=f"period={per}: not selected",
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    )
+                _dbg(f"period {per}: selected")
+                try:
+                    await page.wait_for_selector("div.d_flex.ai_center.jc_space-between", timeout=_UI_TIMEOUT_MS + _SLOW_LOAD_MS)
+                except Exception:
+                    pass
+                await page.wait_for_timeout(350 + max(0, _SLOW_LOAD_MS // 6))
+                groups_raw = await scrape_current_view()
+                if not isinstance(groups_raw, list):
+                    raise _dom_err(
+                        step=f"extract_{per.lower()}",
+                        code="scrape_eval_timeout",
+                        attempt=attempt + 1,
+                        message="scrape returned non-list",
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    )
+                select_err = None
+                break
+            except asyncio.TimeoutError as ex:
+                select_err = _dom_err(
+                    step=f"extract_{per.lower()}",
+                    code="scrape_eval_timeout",
+                    attempt=attempt + 1,
+                    message=f"{type(ex).__name__}: {ex}",
+                    diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                )
+                if attempt >= step_retries:
+                    raise select_err from ex
+                await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
+            except DomStatsError as ex:
+                select_err = ex
+                if attempt >= step_retries:
+                    raise _dom_err(
+                        step=f"select_period_{per.lower()}",
+                        code="period_select_failed",
+                        attempt=attempt + 1,
+                        message=str(ex),
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    ) from ex
+                await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
+            except Exception as ex:
+                select_err = ex
+                if attempt >= step_retries:
+                    raise _dom_err(
+                        step=f"extract_{per.lower()}",
+                        code="scrape_eval_timeout",
+                        attempt=attempt + 1,
+                        message=f"{type(ex).__name__}: {ex}",
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    ) from ex
+                await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
+        if select_err is not None and not groups_raw:
+            raise _dom_err(
+                step=f"extract_{per.lower()}",
+                code="scrape_eval_timeout",
+                message=str(select_err),
+                diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+            ) from select_err
         # If the page is lazy-loading lower blocks, the first scrape may include only the top group.
         # Only scroll if we don't see the key tennis groups (Service/Points/Return).
         try:
@@ -978,7 +1450,22 @@ async def extract_statistics_dom(
         # and scrolling adds a lot of time. Our models rely primarily on Service/Points/Return.
         if len(groups_raw) < 3 or not ({"Подача", "Очки", "Возврат"} & titles):
             await _scroll_for_full_stats()
-            groups_raw = await scrape_current_view()
+            try:
+                groups_raw = await scrape_current_view()
+            except asyncio.TimeoutError as ex:
+                raise _dom_err(
+                    step=f"extract_{per.lower()}",
+                    code="scrape_eval_timeout",
+                    message=f"evaluate timeout after scroll: {type(ex).__name__}: {ex}",
+                    diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                ) from ex
+            except Exception as ex:
+                raise _dom_err(
+                    step=f"extract_{per.lower()}",
+                    code="scrape_eval_timeout",
+                    message=f"{type(ex).__name__}: {ex}",
+                    diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                ) from ex
         if not isinstance(groups_raw, list):
             continue
         _dbg(f"period {per}: groups_raw={len(groups_raw)}")
@@ -1060,8 +1547,20 @@ async def extract_statistics_dom(
         msg = "No per-set statistics found in DOM (missing 1ST/2ND)"
         if isinstance(diag, dict):
             msg += f" | diag={diag}"
-        raise DomStatsError(msg)
+        raise _dom_err(
+            step="wait_rows_2nd",
+            code="rows_not_ready",
+            message=msg,
+            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen, "diag": diag},
+        )
+    diag_meta = {
+        "step": f"extract_{str(periods[-1]).lower() if periods else 'unknown'}",
+        "code": "ok",
+        "attempt": 1,
+        "elapsed_ms": _elapsed_ms(),
+        "varnish_503_seen": varnish_seen,
+    }
     return {
         "statistics": out_periods,
-        "_meta": {"seen": meta_seen, "unmapped": meta_unmapped},
+        "_meta": {"seen": meta_seen, "unmapped": meta_unmapped, "diag": diag_meta},
     }

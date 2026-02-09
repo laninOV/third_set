@@ -26,20 +26,32 @@ class TelegramClient:
     def __init__(self, token: str, chat_id: str):
         self.token = str(token)
         self.chat_id = str(chat_id)
-        self._call_times: Deque[float] = deque()
+        self._send_call_times: Deque[float] = deque()
+        self._poll_call_times: Deque[float] = deque()
 
-    def _throttle(self) -> None:
+    def _resolve_max_rpm(self, kind: str) -> int:
+        # Keep backward compatibility for send side with THIRDSET_TG_MAX_RPM.
+        if kind == "send":
+            raw = os.getenv("THIRDSET_TG_SEND_MAX_RPM")
+            if raw in (None, ""):
+                raw = os.getenv("THIRDSET_TG_MAX_RPM")
+            default = 18
+        else:
+            raw = os.getenv("THIRDSET_TG_POLL_MAX_RPM")
+            default = 0
         try:
-            max_rpm_raw = os.getenv("THIRDSET_TG_MAX_RPM")
-            max_rpm = int(max_rpm_raw) if max_rpm_raw not in (None, "") else 18
+            return int(raw) if raw not in (None, "") else default
         except Exception:
-            max_rpm = 18
+            return default
+
+    def _throttle(self, kind: str) -> None:
+        max_rpm = self._resolve_max_rpm(kind)
         if max_rpm <= 0:
             return
 
         now = time.time()
         window = 60.0
-        dq = self._call_times
+        dq = self._send_call_times if kind == "send" else self._poll_call_times
         try:
             while dq and (now - dq[0] > window):
                 dq.popleft()
@@ -61,7 +73,7 @@ class TelegramClient:
 
     def _api(self, method: str, payload: Dict[str, str], timeout: int = 20) -> Dict:
         try:
-            self._throttle()
+            self._throttle("send")
             api_base = f"https://api.telegram.org/bot{self.token}/{method}"
             data = _urlparse.urlencode(payload).encode("utf-8")
             req = _urlrequest.Request(api_base, data=data)
@@ -84,7 +96,7 @@ class TelegramClient:
 
     def _api_get(self, method: str, payload: Dict[str, Any], timeout: int = 20) -> Dict:
         try:
-            self._throttle()
+            self._throttle("poll")
             qs = _urlparse.urlencode({k: v for k, v in payload.items() if v is not None})
             api_base = f"https://api.telegram.org/bot{self.token}/{method}?{qs}"
             req = _urlrequest.Request(api_base, method="GET")
@@ -136,9 +148,20 @@ class TelegramClient:
 
     def get_updates(self, *, offset: Optional[int] = None, limit: int = 50, timeout: int = 0) -> Dict:
         # Note: timeout is Telegram long-poll seconds; keep 0 by default (instant).
+        t = int(timeout)
         return self._api_get(
             "getUpdates",
-            {"offset": offset, "limit": int(limit), "timeout": int(timeout)},
+            {"offset": offset, "limit": int(limit), "timeout": t},
+            timeout=max(25, t + 10),
+        )
+
+    def get_webhook_info(self) -> Dict:
+        return self._api_get("getWebhookInfo", {}, timeout=20)
+
+    def delete_webhook(self, *, drop_pending_updates: bool = False) -> Dict:
+        return self._api(
+            "deleteWebhook",
+            {"drop_pending_updates": "true" if drop_pending_updates else "false"},
             timeout=20,
         )
 

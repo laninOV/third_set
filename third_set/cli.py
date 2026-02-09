@@ -200,6 +200,22 @@ def _format_tg_message(
     lines.append(_line_kv("Режим", _mode_ru(stats_mode)))
     if set2_winner in ("home", "away", "neutral"):
         lines.append(_line_kv("Победил 2-й сет", {"home": "1", "away": "2", "neutral": "—"}.get(set2_winner, "—")))
+    hdiag = meta.get("history_diag") if isinstance(meta, dict) else None
+    if isinstance(hdiag, dict):
+        for side in ("home", "away"):
+            d = hdiag.get(side)
+            if not isinstance(d, dict):
+                continue
+            t = d.get("timeouts")
+            s = d.get("scanned")
+            v = d.get("valid")
+            b = d.get("budget_hit")
+            c = d.get("code")
+            r = d.get("context_resets")
+            if any(isinstance(x, int) and x > 0 for x in (t, s, v)):
+                lines.append(
+                    f"<code>diag: side={side} code={c or '-'} timeouts={int(t or 0)} scanned={int(s or 0)} valid={int(v or 0)} resets={int(r or 0)} budget_hit={'yes' if b else 'no'}</code>"
+                )
 
     def _pp(x: Any) -> Optional[float]:
         return float(x) * 100.0 if isinstance(x, (int, float)) else None
@@ -359,6 +375,15 @@ def _format_tg_message(
             r = it.get("rating")
             return str(int(round(float(r)))) if isinstance(r, (int, float)) else "—"
 
+        def _tpw_n(side: str, window: str) -> Optional[int]:
+            s = (tpw_scores.get(side) or {}) if isinstance(tpw_scores.get(side), dict) else {}
+            key = "last3" if window == "3" else "last5"
+            it = s.get(key)
+            if not isinstance(it, dict):
+                return None
+            n = it.get("n")
+            return int(n) if isinstance(n, int) else None
+
         def _tpw_trend(side: str) -> str:
             try:
                 r3s = _tpw_rating(side, "3")
@@ -511,6 +536,10 @@ def _format_tg_message(
         r5a = _as_int(_tpw_rating("away", "5"))
         r3h = _as_int(_tpw_rating("home", "3"))
         r3a = _as_int(_tpw_rating("away", "3"))
+        n5h = _tpw_n("home", "5")
+        n5a = _tpw_n("away", "5")
+        n3h = _tpw_n("home", "3")
+        n3a = _tpw_n("away", "3")
         dr5 = (r5h - r5a) if (r5h is not None and r5a is not None) else None
         dr3 = (r3h - r3a) if (r3h is not None and r3a is not None) else None
 
@@ -519,8 +548,18 @@ def _format_tg_message(
         dst = (st_h - st_a) if (st_h is not None and st_a is not None) else None
 
         key_metrics = [
-            ("rating5 (сила)", f"{r5h if r5h is not None else '—'}", f"{r5a if r5a is not None else '—'}", float(dr5) if dr5 is not None else None),
-            ("rating3 (сила)", f"{r3h if r3h is not None else '—'}", f"{r3a if r3a is not None else '—'}", float(dr3) if dr3 is not None else None),
+            (
+                f"rating5 (сила, n={n5h if isinstance(n5h, int) else 0}/{n5a if isinstance(n5a, int) else 0})",
+                f"{r5h if r5h is not None else '—'}",
+                f"{r5a if r5a is not None else '—'}",
+                float(dr5) if dr5 is not None else None,
+            ),
+            (
+                f"rating3 (сила, n={n3h if isinstance(n3h, int) else 0}/{n3a if isinstance(n3a, int) else 0})",
+                f"{r3h if r3h is not None else '—'}",
+                f"{r3a if r3a is not None else '—'}",
+                float(dr3) if dr3 is not None else None,
+            ),
             ("стабильность", f"{st_h if st_h is not None else '—'}", f"{st_a if st_a is not None else '—'}", float(dst) if dst is not None else None),
         ]
         for lab, key in (
@@ -570,6 +609,8 @@ def _format_tg_message(
                     d = f"{diff:+.0f}пп"
                 w = _win_of(diff)
             lines.append(f"- {_html_escape(lab)}: { _html_escape(str(a)) } vs { _html_escape(str(b)) } | Δ={_html_escape(d)} | выше={_html_escape(w)}")
+        if (isinstance(n5h, int) and n5h < 5) or (isinstance(n5a, int) and n5a < 5):
+            lines.append("<i>Примечание</i>: rating5 посчитан по доступным матчам (n&lt;5), поэтому динамика 3 vs 5 может совпадать.")
 
         # Compact module status (one line)
         by_name = {m.name: m for m in (mods or []) if hasattr(m, "name")}
@@ -599,8 +640,6 @@ def _format_tg_message(
             diff: Optional[float],
             *,
             is_rating: bool = False,
-            consensus_side: Optional[str] = None,
-            mark_if_consensus: bool = False,
         ) -> str:
             if diff is None:
                 d = "—"
@@ -616,7 +655,7 @@ def _format_tg_message(
             # not on hidden thresholds like n>=3.
             def _first_number(s: str) -> Optional[float]:
                 try:
-                    m = re.search(r"(-?\\d+(?:[\\.,]\\d+)?)", s)
+                    m = re.search(r"(-?\d+(?:[.,]\d+)?)", s)
                     if not m:
                         return None
                     return float(m.group(1).replace(",", "."))
@@ -632,25 +671,7 @@ def _format_tg_message(
                     w = "2"
                 else:
                     w = "нейтр"
-            allow_mark = w in ("1", "2")
-
-            # Put ✅ right next to the winning number (what you asked for: "43 vs 45✅"),
-            # and keep "выше=1/2" as the explicit label.
-            left_out = left
-            right_out = right
-            if allow_mark and (not mark_if_consensus):
-                if w == "1":
-                    left_out = f"{left_out}✅"
-                elif w == "2":
-                    right_out = f"{right_out}✅"
-            elif allow_mark and mark_if_consensus and consensus_side in ("1", "2"):
-                if w == consensus_side:
-                    if w == "1":
-                        left_out = f"{left_out}✅"
-                    elif w == "2":
-                        right_out = f"{right_out}✅"
-
-            return f"- {label}: {left_out} vs {right_out} | Δ={d} | выше={w}"
+            return f"- {label}: {left} vs {right} | Δ={d} | выше={w}"
 
         lines.append("")
         lines.append("<b>Модули (ключевые)</b>")
@@ -662,8 +683,6 @@ def _format_tg_message(
                 str(r5a if r5a is not None else "—"),
                 float(dr5) if dr5 is not None else None,
                 is_rating=True,
-                consensus_side=consensus,
-                mark_if_consensus=True,
             )
         )
         # M2: SSW12 + BPSR12 (if available)
@@ -1864,7 +1883,7 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
                     user_data_dir=profile_dir,
                     headless=headless,
                     args=launch_args,
-                    locale="ru-RU",
+                    locale="en-US",
                     timezone_id="Europe/Moscow",
                     viewport={"width": 1440, "height": 900},
                     user_agent=(
@@ -1884,7 +1903,7 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
                         user_data_dir=alt,
                         headless=headless,
                         args=launch_args,
-                        locale="ru-RU",
+                        locale="en-US",
                         timezone_id="Europe/Moscow",
                         viewport={"width": 1440, "height": 900},
                         user_agent=(
@@ -1898,7 +1917,7 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
         else:
             browser = await p.chromium.launch(headless=headless, args=launch_args)
             context = await browser.new_context(
-                locale="ru-RU",
+                locale="en-US",
                 timezone_id="Europe/Moscow",
                 viewport={"width": 1440, "height": 900},
                 user_agent=(
@@ -1913,7 +1932,7 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
                 """
                 // Playwright/Chromium automation hardening (minimal).
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US','en'] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en','ru-RU','ru'] });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
                 // Prevent popups (some Sofascore widgets open other sports/pages).
                 try {
@@ -1990,8 +2009,7 @@ async def _with_browser(headless: bool, fn, *, profile_dir: Optional[str] = None
             if "/tennis" not in u:
                 await page.goto(SOFASCORE_TENNIS_URL, wait_until="domcontentloaded", timeout=25_000)
                 return
-            # Do NOT force locale here; Sofascore can redirect based on region/headers.
-            # We accept /ru/tennis and /en-us/tennis equally as long as it stays in tennis.
+            # Locale is normalized in sofascore helpers; keep the user inside tennis scope here.
         try:
             try:
                 await page.bring_to_front()
@@ -2761,7 +2779,7 @@ async def cmd_tg_updates(*, tg_token: str, tg_chat: str, limit: int) -> int:
     return 0
 
 
-async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[str] = None) -> int:
+async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[str] = None, history_only: bool = False) -> int:
     """
     Telegram bot loop:
     - menu buttons: Analyze all live, List live, Analyze by ID
@@ -2791,6 +2809,15 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         "resize_keyboard": True,
         "one_time_keyboard": False,
     }
+    upcoming_hours_markup = {
+        "keyboard": [
+            ["1", "2", "3", "4", "5"],
+            ["6", "7", "8", "9", "10"],
+            ["Отмена"],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
 
     pending_id: Dict[str, bool] = {}
     pending_upcoming: Dict[str, bool] = {}
@@ -2798,10 +2825,22 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     offset = None
     stop_flag = {"stop": False}
     active_task: Dict[str, Optional[asyncio.Task]] = {"task": None}
+    last_analyze_failure: Dict[str, Optional[str]] = {"code": None}
+    last_cmd: Dict[str, Tuple[str, float]] = {}
+    poll_state: Dict[str, Any] = {"last_update_id": None, "last_batch_updates": 0}
+    try:
+        debounce_ms = int(os.getenv("THIRDSET_TG_DEBOUNCE_MS") or "300")
+    except Exception:
+        debounce_ms = 300
     try:
         analyze_timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "240")
     except Exception:
         analyze_timeout_s = 240
+    try:
+        analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "180")
+    except Exception:
+        analyze_timeout_hist_s = 180
+    no_limits_mode = os.getenv("THIRDSET_NO_LIMITS", "1").strip().lower() not in ("0", "false", "no")
 
     async def send(text: str) -> None:
         # Optional debug prefix to detect “stale bot instance” issues.
@@ -2809,6 +2848,26 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             prefix = f"[third_set tg-bot build={build} session={session}]\n" if build else f"[third_set tg-bot session={session}]\n"
             text = prefix + (text or "")
         await asyncio.to_thread(client.send_text_result, text, reply_markup=reply_markup)
+
+    def _norm_cmd_text(s: str) -> str:
+        t = (s or "").strip().lower().replace("ё", "е")
+        t = re.sub(r"\s+", " ", t).strip()
+        # Keep letters/digits/slash/space/hyphen; drop decorative punctuation like ((((( or !!!.
+        t = re.sub(r"[^\w/\s-]+", " ", t, flags=re.UNICODE)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def _cmd_eq_or_prefix(cmd: str, aliases: Tuple[str, ...]) -> bool:
+        if cmd in aliases:
+            return True
+        for a in aliases:
+            if cmd.startswith(a + " "):
+                return True
+        return False
+
+    def _log_route(raw: str, norm: str, handler: str) -> None:
+        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+            print(f"[TG] route raw={raw!r} norm={norm!r} -> {handler}", flush=True)
 
     # IMPORTANT: the same Playwright Page cannot be navigated concurrently.
     # To reduce captcha/challenge frequency we keep everything in ONE tab and serialize navigation.
@@ -2869,101 +2928,281 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             print(f"[TG] upcoming(dom): cards={len(cards)}", flush=True)
         return cards
 
+    def _fmt_start_local(st: Optional[int]) -> str:
+        if not isinstance(st, int):
+            return "—"
+        try:
+            now_lt = time.localtime()
+            lt = time.localtime(int(st))
+            if (lt.tm_year, lt.tm_yday) == (now_lt.tm_year, now_lt.tm_yday):
+                return time.strftime("%H:%M", lt)
+            return time.strftime("%d.%m %H:%M", lt)
+        except Exception:
+            return "—"
+
+    def _ordered_reason_parts(skip_reasons: Dict[str, int]) -> List[str]:
+        parts: List[str] = []
+        for k in (
+            "outside_window",
+            "in_tab_but_past_start",
+            "not_singles",
+            "not_bo3",
+            "status_not_upcoming",
+            "no_start_time",
+            "bad_card",
+        ):
+            v = skip_reasons.get(k, 0)
+            if v:
+                parts.append(f"{k}={v}")
+        return parts
+
+    def _looks_like_doubles_card(card: Dict[str, Any]) -> bool:
+        try:
+            home = str(card.get("homeName") or card.get("home") or "")
+            away = str(card.get("awayName") or card.get("away") or "")
+            # Sofascore doubles names are usually "Player A / Player B".
+            return (" / " in home) or (" / " in away)
+        except Exception:
+            return False
+
+    async def _hydrate_upcoming_card(page: Page, card: Dict[str, Any]) -> None:
+        if bool(card.get("_hydrate_attempted")):
+            return
+        card["_hydrate_attempted"] = True
+        eid = card.get("id")
+        if not isinstance(eid, int):
+            return
+        try:
+            async with nav_lock:
+                payload = await get_event_via_navigation(page, int(eid), timeout_ms=10_000)
+            ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+            if not isinstance(ev, dict):
+                card["enriched"] = False
+                return
+            est = ev.get("startTimestamp")
+            if isinstance(est, int):
+                card["startTimestamp"] = est
+            card["status"] = str(((ev.get("status") or {}).get("type")) or card.get("status") or "").lower()
+            card["defaultPeriodCount"] = ev.get("defaultPeriodCount", card.get("defaultPeriodCount"))
+            card["isSingles"] = bool(is_singles_event(ev))
+            if ev.get("slug"):
+                card["slug"] = ev.get("slug")
+            if ev.get("customId"):
+                card["customId"] = ev.get("customId")
+            if isinstance(ev.get("homeTeam"), dict):
+                card["homeName"] = (ev.get("homeTeam") or {}).get("name") or card.get("homeName")
+                card["homeId"] = (ev.get("homeTeam") or {}).get("id")
+                card["homeSlug"] = (ev.get("homeTeam") or {}).get("slug")
+            if isinstance(ev.get("awayTeam"), dict):
+                card["awayName"] = (ev.get("awayTeam") or {}).get("name") or card.get("awayName")
+                card["awayId"] = (ev.get("awayTeam") or {}).get("id")
+                card["awaySlug"] = (ev.get("awayTeam") or {}).get("slug")
+            card["enriched"] = True
+        except Exception:
+            card["enriched"] = bool(card.get("enriched")) and isinstance(card.get("startTimestamp"), int)
+
+    def _upcoming_event_from_card(card: Dict[str, Any]) -> Dict[str, Any]:
+        ev = {
+            "id": int(card.get("id")),
+            "slug": card.get("slug"),
+            "customId": card.get("customId"),
+            "homeTeam": {"name": card.get("homeName") or card.get("home")},
+            "awayTeam": {"name": card.get("awayName") or card.get("away")},
+            "startTimestamp": card.get("startTimestamp"),
+            "status": {"type": card.get("status")},
+            "defaultPeriodCount": card.get("defaultPeriodCount"),
+        }
+        try:
+            ev["homeTeam"]["id"] = int(card.get("homeId")) if card.get("homeId") is not None else None
+        except Exception:
+            ev["homeTeam"]["id"] = None
+        try:
+            ev["awayTeam"]["id"] = int(card.get("awayId")) if card.get("awayId") is not None else None
+        except Exception:
+            ev["awayTeam"]["id"] = None
+        if card.get("homeSlug"):
+            ev["homeTeam"]["slug"] = card.get("homeSlug")
+        if card.get("awaySlug"):
+            ev["awayTeam"]["slug"] = card.get("awaySlug")
+        return ev
+
+    async def _normalize_upcoming_for_analysis(
+        page: Page,
+        cards: List[Dict[str, Any]],
+        *,
+        hours: float,
+        max_items: Optional[int] = None,
+        log_details: bool = False,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        horizon = now + max(0.25, float(hours)) * 3600.0
+        eligible: List[Dict[str, Any]] = []
+        excluded: List[Dict[str, Any]] = []
+        skip_reasons: Dict[str, int] = {}
+        for c in cards:
+            eid = c.get("id")
+            reason: Optional[str] = None
+            if not isinstance(eid, int):
+                reason = "bad_card"
+            else:
+                status = str(c.get("status") or "").lower()
+                st = c.get("startTimestamp")
+                if (
+                    not status
+                    or not isinstance(st, int)
+                    or c.get("isSingles") is None
+                    or c.get("defaultPeriodCount") is None
+                ):
+                    await _hydrate_upcoming_card(page, c)
+                status = str(c.get("status") or "").lower()
+                st = c.get("startTimestamp")
+                if status in ("inprogress", "finished", "canceled", "cancelled", "postponed"):
+                    reason = "status_not_upcoming"
+                elif not isinstance(st, int):
+                    reason = "no_start_time"
+                elif st < int(now):
+                    reason = "in_tab_but_past_start"
+                elif st > horizon:
+                    reason = "outside_window"
+                elif c.get("isSingles") is False:
+                    reason = "not_singles"
+                elif c.get("isSingles") is None and _looks_like_doubles_card(c):
+                    # Hydration can occasionally miss isSingles; fallback to name pattern.
+                    reason = "not_singles"
+                else:
+                    dpc = c.get("defaultPeriodCount")
+                    if isinstance(dpc, int) and dpc != 3:
+                        reason = "not_bo3"
+
+            if reason is not None:
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                excluded.append({"card": c, "reason": reason})
+                if log_details and os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                    print(
+                        f"[TG] upcoming normalize: id={eid} reason={reason} "
+                        f"status={c.get('status')} start={c.get('startTimestamp')}",
+                        flush=True,
+                    )
+                continue
+
+            item = {"event": _upcoming_event_from_card(c), "card": c}
+            eligible.append(item)
+            if max_items is not None and len(eligible) >= int(max_items):
+                break
+        return {"eligible": eligible, "excluded": excluded, "skip_reasons": skip_reasons, "now": now, "horizon": horizon}
+
     async def _list_live(page: Page) -> None:
         cards = await _get_live_cards(page)
         if not cards:
             await send("Live матчей не найдено.")
             return
+        shown = 0
         lines: List[str] = []
         for i, c in enumerate(cards, 1):
             hid = c.get("id")
-            home = str(c.get("home") or "—")
-            away = str(c.get("away") or "—")
+            home = str(c.get("home") or "—").strip() or "—"
+            away = str(c.get("away") or "—").strip() or "—"
             score = str(c.get("score") or "—")
             lines.append(f"{i}. {home} vs {away} | счёт: {score} | id={hid}")
+            shown += 1
             if i >= 40:
                 break
-        await send(f"Live найдено: всего={len(cards)}\n" + "\n".join(lines))
+        await send(f"Live сейчас: сырых={len(cards)}, показано={shown}\n" + "\n".join(lines))
 
     async def _list_upcoming(page: Page, *, hours: Optional[float] = None) -> None:
         cards = await _get_upcoming_cards(page)
         if not cards:
             await send("Upcoming матчей не найдено.")
             return
+        list_limit = 20
         now = time.time()
         horizon = now + (float(hours) * 3600.0) if isinstance(hours, (int, float)) and hours > 0 else None
-        lines: List[str] = []
-        kept = 0
+        skip_reasons: Dict[str, int] = {}
+        display_rows: List[Tuple[Tuple[int, int, int], str]] = []
+        seq = 0
         for c in cards:
             eid = c.get("id")
             if not isinstance(eid, int):
+                skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
                 continue
-            st = None
-            ev: dict = {}
-            try:
-                async with nav_lock:
-                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=20_000)
-                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
-                st = ev.get("startTimestamp")
-            except Exception:
-                st = None
-                ev = {}
+            st = c.get("startTimestamp")
+            if not isinstance(st, int):
+                await _hydrate_upcoming_card(page, c)
+                st = c.get("startTimestamp")
+            status = str(c.get("status") or "").lower()
             if isinstance(st, int) and horizon is not None and st > horizon:
+                skip_reasons["outside_window"] = skip_reasons.get("outside_window", 0) + 1
                 continue
-            # Prefer authoritative names from the event payload (DOM cards can contain labels like "Отменено").
-            status = (ev.get("status") or {}).get("type") if isinstance(ev, dict) else None
-            if str(status or "").lower() in ("canceled", "cancelled", "postponed"):
+            is_singles = c.get("isSingles")
+            if is_singles is False or (is_singles is None and _looks_like_doubles_card(c)):
+                skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
                 continue
-            home = str(((ev.get("homeTeam") or {}).get("name")) or c.get("home") or "—")
-            away = str(((ev.get("awayTeam") or {}).get("name")) or c.get("away") or "—")
-            score = str(c.get("score") or "—")
-            lines.append(f"{kept+1}. {home} vs {away} | время/счёт: {score} | id={eid}")
-            kept += 1
-            if kept >= 40:
-                break
-        header = f"Upcoming сейчас: всего={len(cards)}"
+            if not isinstance(st, int):
+                skip_reasons["no_start_time"] = skip_reasons.get("no_start_time", 0) + 1
+            home = str(c.get("homeName") or c.get("home") or "—")
+            away = str(c.get("awayName") or c.get("away") or "—")
+            start_s = _fmt_start_local(st if isinstance(st, int) else None)
+            flags: List[str] = []
+            if isinstance(st, int) and st < int(now):
+                flags.append("past_start_by_timestamp")
+            if status in ("inprogress", "finished", "canceled", "cancelled", "postponed"):
+                flags.append(f"status={status}")
+            if not bool(c.get("enriched")):
+                flags.append("enriched=no")
+            flag_s = f" [{', '.join(flags)}]" if flags else ""
+            row = f"{home} vs {away} | старт: {start_s} | id={eid}{flag_s}"
+            if isinstance(st, int):
+                if st >= int(now):
+                    sort_key = (0, int(st), seq)
+                else:
+                    sort_key = (1, int(st), seq)
+            else:
+                sort_key = (2, 0, seq)
+            display_rows.append((sort_key, row))
+            seq += 1
+        display_rows.sort(key=lambda x: x[0])
+        lines: List[str] = [f"{i}. {r}" for i, (_k, r) in enumerate(display_rows[:list_limit], 1)]
+        kept = len(lines)
+        header = f"Upcoming сейчас: сырых={len(cards)}, показано={kept}"
         if horizon is not None:
             header += f", окно={hours:g}ч"
-        await send(header + "\n" + ("\n".join(lines) if lines else "Нет матчей в выбранном окне."))
+        preview_hours = float(hours) if isinstance(hours, (int, float)) and hours > 0 else 2.0
+        preview = await _normalize_upcoming_for_analysis(page, cards, hours=preview_hours, max_items=None, log_details=False)
+        eligible_preview = len(preview.get("eligible") or [])
+        parts: List[str] = []
+        for k in ("outside_window", "not_singles", "no_start_time", "bad_card"):
+            v = skip_reasons.get(k, 0)
+            if v:
+                parts.append(f"{k}={v}")
+        extra = f"\nПричины пропуска: {', '.join(parts)}" if parts else ""
+        potential_line = f"\nДля анализа в окне {preview_hours:g}ч потенциально подходят: {eligible_preview}"
+        await send(header + "\n" + ("\n".join(lines) if lines else "Нет матчей в выбранном окне.") + potential_line + extra)
 
     async def _analyze_upcoming(page: Page, *, hours: float) -> None:
         cards = await _get_upcoming_cards(page)
-        now = time.time()
-        horizon = now + max(0.25, float(hours)) * 3600.0
-        # Filter by startTimestamp; also keep BO3 singles only.
-        filtered: List[Dict[str, Any]] = []
-        for c in cards:
-            eid = c.get("id")
-            if not isinstance(eid, int):
-                continue
-            try:
-                async with nav_lock:
-                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=20_000)
-                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
-            except Exception:
-                continue
-            st = ev.get("startTimestamp")
-            if isinstance(st, int) and st > horizon:
-                continue
-            if not is_singles_event(ev):
-                continue
-            dpc = ev.get("defaultPeriodCount")
-            if isinstance(dpc, int) and dpc != 3:
-                continue
-            # Only not-started matches; ignore cancelled/finished/live that leaked into the tab.
-            status = str(((ev.get("status") or {}).get("type")) or "").lower()
-            if status in ("canceled", "cancelled", "postponed"):
-                continue
-            if status and status not in ("notstarted", "not_started", "scheduled"):
-                continue
-            filtered.append({"event": ev, "card": c})
-            if len(filtered) >= 12:
-                break
+        try:
+            max_upcoming_analyze = int(os.getenv("THIRDSET_UPCOMING_ANALYZE_LIMIT") or "40")
+        except Exception:
+            max_upcoming_analyze = 40
+        max_upcoming_analyze = max(1, min(200, max_upcoming_analyze))
+        norm = await _normalize_upcoming_for_analysis(
+            page,
+            cards,
+            hours=float(hours),
+            max_items=max_upcoming_analyze,
+            log_details=True,
+        )
+        filtered: List[Dict[str, Any]] = list(norm.get("eligible") or [])
+        skip_reasons: Dict[str, int] = dict(norm.get("skip_reasons") or {})
 
         if not filtered:
-            await send(f"Нет подходящих upcoming матчей в окне {hours:g}ч.")
+            parts = _ordered_reason_parts(skip_reasons)
+            extra = f"\nПричины пропуска: " + ", ".join(parts) if parts else ""
+            await send(f"Нет подходящих upcoming матчей в окне {hours:g}ч.{extra}")
             return
-        await send(f"Запускаю анализ upcoming (окно {hours:g}ч)… матчей={len(filtered)}")
+        parts = _ordered_reason_parts(skip_reasons)
+        extra = f"\nПричины пропуска: " + ", ".join(parts) if parts else ""
+        await send(f"Запускаю анализ upcoming (окно {hours:g}ч)… матчей={len(filtered)}{extra}")
 
         ok = 0
         skipped = 0
@@ -2978,10 +3217,13 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             away = ((ev.get("awayTeam") or {}).get("name")) or str(c.get("away") or "—")
             print(f"[TG] analyze_upcoming: {i}/{len(filtered)} id={eid} {home} vs {away}", flush=True)
             if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
-                print(f"[TG] progress: analyzing {i}/{len(filtered)} eventId={eid}", flush=True)
+                print(f"[TG] progress: analyzing {i}/{len(filtered)} eventId={eid} ok={ok} skip={skipped}", flush=True)
             try:
-                await _analyze_event(page, ev)  # history_only будет выбран автоматически (сеты не 1:1)
-                ok += 1
+                ok_one = await _analyze_event(page, ev)  # history_only будет выбран автоматически (сеты не 1:1)
+                if ok_one:
+                    ok += 1
+                else:
+                    skipped += 1
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2990,10 +3232,12 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         dt = int(time.time() - started)
         await send(f"Готово upcoming: ok={ok} skip={skipped} t={dt}s")
 
-    async def _analyze_event(page: Page, ev: Dict[str, Any]) -> None:
+    async def _analyze_event(page: Page, ev: Dict[str, Any]) -> bool:
+        use_history_only = bool(history_only)
+        last_analyze_failure["code"] = None
         try:
             if stop_flag["stop"]:
-                return
+                return False
             payload = {"event": ev}
             e = ev
             event_id = int(e.get("id"))
@@ -3001,34 +3245,62 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             custom = e.get("customId")
             base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
             match_url = f"{base}/tennis/match/{slug}/{custom}" if slug and custom else f"{base}/event/{event_id}"
-            history_only = not _is_set_score_1_1_after_two_sets(payload)
+            use_history_only = history_only or (not _is_set_score_1_1_after_two_sets(payload))
             if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                 print(
-                    f"[TG] analyze_event start eventId={event_id} history_only={history_only} url={match_url}",
+                    f"[TG] analyze_event start eventId={event_id} history_only={use_history_only} url={match_url}",
                     flush=True,
                 )
             # Retry once on timeout with a larger budget (server often slow / CF).
+            # For history-only mode a second full pass is usually redundant and very expensive.
             last_timeout = None
-            for attempt in range(2):
+            attempts = 1 if use_history_only else 2
+            for attempt in range(attempts):
                 try:
-                    tlim = analyze_timeout_s if attempt == 0 else int(analyze_timeout_s * 1.5)
+                    base_timeout = analyze_timeout_hist_s if use_history_only else analyze_timeout_s
+                    tlim = base_timeout if attempt == 0 else int(base_timeout * 1.5)
                     if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                         print(f"[TG] analyze_event attempt={attempt+1} timeout={tlim}s eventId={event_id}", flush=True)
                     async with nav_lock:
-                        ctx, mods, final_side, score, meta = await asyncio.wait_for(
-                            analyze_once(
+                        if use_history_only and no_limits_mode:
+                            ctx, mods, final_side, score, meta = await analyze_once(
                                 page,
                                 event_payload=payload,
                                 match_url=match_url,
                                 event_id=event_id,
                                 max_history=max_history,
-                                history_only=history_only,
+                                history_only=use_history_only,
                                 progress_cb=progress_cb,
                                 audit_history=False,
                                 audit_features=True,
-                            ),
-                            timeout=tlim,
-                        )
+                            )
+                        else:
+                            ctx, mods, final_side, score, meta = await asyncio.wait_for(
+                                analyze_once(
+                                    page,
+                                    event_payload=payload,
+                                    match_url=match_url,
+                                    event_id=event_id,
+                                    max_history=max_history,
+                                    history_only=use_history_only,
+                                    progress_cb=progress_cb,
+                                    audit_history=False,
+                                    audit_features=True,
+                                ),
+                                timeout=tlim,
+                            )
+                    try:
+                        if os.getenv("THIRDSET_PROGRESS") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                            feat = meta.get("features") if isinstance(meta, dict) else None
+                            hist = feat.get("history") if isinstance(feat, dict) else None
+                            hh = hist.get("home") if isinstance(hist, dict) else None
+                            ha = hist.get("away") if isinstance(hist, dict) else None
+                            hn = hh.get("n") if isinstance(hh, dict) else None
+                            an = ha.get("n") if isinstance(ha, dict) else None
+                            if isinstance(hn, int) and isinstance(an, int):
+                                print(f"[TG] history collected: home={hn}/{max_history} away={an}/{max_history}", flush=True)
+                    except Exception:
+                        pass
                     meta["mode"] = "normal"
                     msg = _format_tg_message(
                         event_id=ctx.event_id,
@@ -3043,10 +3315,10 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         mods=mods,
                     )
                     await asyncio.to_thread(client.send_text_result, msg, reply_markup=reply_markup)
-                    return
+                    return True
                 except asyncio.TimeoutError as ex:
                     last_timeout = ex
-                    if attempt == 0:
+                    if (attempt + 1) < attempts:
                         # brief backoff before retry
                         await asyncio.sleep(1.0)
                         continue
@@ -3061,17 +3333,52 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 eid = ev.get("id")
             except Exception:
                 home, away, eid = "—", "—", ev.get("id")
-            await send(f"{home} vs {away}\nSofascore\neventId={eid}\nНедостаточно статистики.\n{ex}")
+            ex_text = str(ex or "").strip()
+            code = None
+            lo = ex_text.lower()
+            m = re.search(r"\bcode=([a-z0-9_]+)\b", lo)
+            if m:
+                code = m.group(1)
+            if "timeout storm" in lo:
+                code = "timeout_storm"
+            elif "503 backend read error" in lo:
+                code = "varnish_503"
+            elif "profile_links_empty" in lo:
+                code = "profile_links_empty"
+            elif "no_finished_singles" in lo:
+                code = "no_finished_singles"
+            if code:
+                # Avoid duplicating "code=..." in the next line: keep code only in code_line.
+                ex_text = re.sub(r"\bcode=[a-z0-9_]+\b\s*", "", ex_text, flags=re.I).strip()
+                ex_text = re.sub(r"\s{2,}", " ", ex_text).strip()
+            code_line = f"\ncode={code}" if code else ""
+            last_analyze_failure["code"] = code or "sofascore_error"
+            await send(f"{home} vs {away}\nSofascore\neventId={eid}\nНедостаточно статистики.{code_line}\n{ex_text}")
+            return False
         except asyncio.TimeoutError:
-            # Don't spam chat with progress noise; send a single clear error.
+            # Keep a deterministic domain error in history-only mode.
             try:
                 home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
                 away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
             except Exception:
                 home, away = "—", "—"
-            await send(f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\nТаймаут анализа ({analyze_timeout_s}s).")
+            timeout_s = analyze_timeout_hist_s if use_history_only else analyze_timeout_s
+            if use_history_only:
+                last_analyze_failure["code"] = "timeout_storm"
+                await send(
+                    f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\n"
+                    f"Недостаточно статистики.\ncode=timeout_storm\n"
+                    f"История не собрана: timeout storm (достигнут лимит анализа {timeout_s}s в history_only)."
+                )
+                return False
+            last_analyze_failure["code"] = "analyze_timeout"
+            await send(f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\nТаймаут анализа ({timeout_s}s).")
+            return False
         except Exception as ex:
+            last_analyze_failure["code"] = type(ex).__name__.lower() or "exception"
             await send(f"Ошибка анализа id={ev.get('id')}: {ex}")
+            return False
+        return False
 
     async def _analyze_all(page: Page) -> None:
         cards = await _get_live_cards(page)
@@ -3095,7 +3402,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                     if i >= 30:
                         break
                 suffix = "" if len(cards) <= 30 else f"\n…и ещё {len(cards) - 30}"
-                await send(f"Live сейчас: {len(cards)} матчей\n" + "\n".join(lines) + suffix)
+                await send(f"Live сейчас: сырых={len(cards)}, показано={min(len(cards), 30)}\n" + "\n".join(lines) + suffix)
         except Exception:
             pass
 
@@ -3133,8 +3440,18 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 home = ((ev.get("homeTeam") or {}).get("name")) or "—"
                 away = ((ev.get("awayTeam") or {}).get("name")) or "—"
                 print(f"[TG] analyze_all: {idx}/{total} id={eid} {home} vs {away}", flush=True)
-                await _analyze_event(page, ev)
-                count += 1
+                ok_one = await _analyze_event(page, ev)
+                if ok_one:
+                    count += 1
+                else:
+                    skipped += 1
+                    skip_reasons["analyze_failed"] = skip_reasons.get("analyze_failed", 0) + 1
+                    rcode = str(last_analyze_failure.get("code") or "").strip().lower()
+                    if rcode:
+                        key = f"analyze_failed_{rcode}"
+                        skip_reasons[key] = skip_reasons.get(key, 0) + 1
+                        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                            print(f"[TG] analyze_all: id={eid} failed_code={rcode}", flush=True)
                 if count % 3 == 0:
                     dt = int(time.time() - started)
                     print(f"[TG] analyze_all: прогресс ok={count} skip={skipped} t={dt}s", flush=True)
@@ -3150,17 +3467,32 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             dt = int(time.time() - started)
             # Compact, but actionable: show why we skipped.
             parts: List[str] = []
-            for k in ("bad_card", "event_fetch_failed", "not_singles", "not_bo3", "exception"):
+            for k in ("bad_card", "event_fetch_failed", "not_singles", "not_bo3", "analyze_failed", "exception"):
                 v = skip_reasons.get(k, 0)
                 if v:
                     parts.append(f"{k}={v}")
+            code_parts = sorted(
+                ((k, v) for k, v in skip_reasons.items() if str(k).startswith("analyze_failed_") and int(v) > 0),
+                key=lambda kv: int(kv[1]),
+                reverse=True,
+            )
+            if code_parts:
+                top = ", ".join(f"{k.replace('analyze_failed_', '')}={v}" for k, v in code_parts[:4])
+                parts.append(f"codes[{top}]")
             extra = f"\nПричины пропуска: " + ", ".join(parts) if parts else ""
             await send(f"Готово. Проанализировано матчей: {count} (пропущено {skipped}), время {dt}s{extra}")
 
     async def _analyze_ids(page: Page, ids: List[int]) -> None:
         print(f"[TG] analyze_ids: requested={ids}", flush=True)
-        cards = await _get_live_cards(page)
-        by_id = {int(c.get("id")): c for c in cards if isinstance(c, dict) and isinstance(c.get("id"), int)}
+        live_cards = await _get_live_cards(page)
+        upcoming_cards = await _get_upcoming_cards(page)
+        by_id: Dict[int, Dict[str, Any]] = {}
+        for c in (live_cards + upcoming_cards):
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id")
+            if isinstance(cid, int) and int(cid) not in by_id:
+                by_id[int(cid)] = c
         total = len(ids)
         done = 0
         print(f"[TG] analyze_ids: start total={total}", flush=True)
@@ -3168,30 +3500,54 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             if stop_flag["stop"]:
                 break
             c = by_id.get(int(eid))
-            if not c:
-                await send(f"id={eid} не найден в live.")
-                continue
-            url = c.get("url")
-            if not isinstance(url, str) or not url:
-                await send(f"id={eid}: нет ссылки матча.")
-                continue
             try:
                 print(f"[TG] analyze_ids: {done+1}/{total} start id={eid}", flush=True)
+                ev: Dict[str, Any] = {}
                 async with nav_lock:
                     payload = await get_event_via_navigation(page, int(eid), timeout_ms=25_000)
-                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                    ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                    if not isinstance(ev, dict) or not ev.get("id"):
+                        try:
+                            payload2 = await get_event(page, int(eid))
+                        except Exception:
+                            payload2 = {}
+                        ev = (payload2.get("event") or {}) if isinstance(payload2, dict) else {}
+                    if (not isinstance(ev, dict) or not ev.get("id")) and isinstance(c, dict):
+                        url = c.get("url")
+                        if isinstance(url, str) and url:
+                            try:
+                                payload3 = await get_event_from_match_url_auto(page, str(url))
+                            except Exception:
+                                payload3 = {}
+                            ev = (payload3.get("event") or {}) if isinstance(payload3, dict) else {}
                 if not isinstance(ev, dict) or not ev.get("id"):
-                    await send(f"id={eid}: не удалось получить event.")
+                    await send(f"id={eid}: не удалось получить event (нет в live/upcoming или недоступен в Sofascore API).")
                     continue
-                await _analyze_event(page, ev)
-                done += 1
-                print(f"[TG] analyze_ids: {done}/{total} done id={eid}", flush=True)
+                ok_one = await _analyze_event(page, ev)
+                if ok_one:
+                    done += 1
+                    print(f"[TG] analyze_ids: {done}/{total} done id={eid}", flush=True)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
                 await send(f"Ошибка анализа id={eid}: {ex}")
 
     async def run(page: Page) -> int:
+        # Polling and webhook are mutually exclusive in Telegram Bot API.
+        # Force polling mode to avoid "updates not arriving" when webhook is left configured.
+        try:
+            wh = await asyncio.to_thread(client.get_webhook_info)
+            if isinstance(wh, dict) and wh.get("ok"):
+                info = wh.get("result") or {}
+                wh_url = str((info.get("url") or "")).strip() if isinstance(info, dict) else ""
+                if wh_url:
+                    print(f"TG bot: webhook detected, disabling for polling: {wh_url}", flush=True)
+                    dres = await asyncio.to_thread(client.delete_webhook, drop_pending_updates=False)
+                    if not (isinstance(dres, dict) and dres.get("ok")):
+                        print(f"TG bot: deleteWebhook failed: {dres}", flush=True)
+        except Exception as ex:
+            print(f"TG bot: webhook check failed: {ex}", flush=True)
+
         try:
             await send("Бот запущен. Выбери действие в меню.")
         except Exception as ex:
@@ -3213,48 +3569,95 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             print(f"TG bot: warmup navigation failed: {ex}", flush=True)
         print("TG bot: ready (waiting for updates)", flush=True)
         nonlocal offset
-        # Drain backlog so we don't "replay" old button presses and instantly stop.
-        try:
-            upd0 = client.get_updates(offset=None, limit=50, timeout=0)
-            if isinstance(upd0, dict) and upd0.get("ok"):
-                items0 = upd0.get("result") or []
-                max_id = None
-                for it in items0 if isinstance(items0, list) else []:
-                    uid = it.get("update_id") if isinstance(it, dict) else None
-                    if isinstance(uid, int):
-                        max_id = uid if max_id is None else max(max_id, uid)
-                if isinstance(max_id, int):
-                    offset = max_id + 1
-                    if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+        # Drain stale backlog by default, so old commands (e.g. "СТОП") are not replayed on startup.
+        # Set THIRDSET_TG_DRAIN_BACKLOG=0 to keep backlog intentionally.
+        drain_backlog = os.getenv("THIRDSET_TG_DRAIN_BACKLOG", "1").strip().lower() not in ("0", "false", "no")
+        if drain_backlog:
+            try:
+                upd0 = client.get_updates(offset=None, limit=50, timeout=0)
+                if isinstance(upd0, dict) and upd0.get("ok"):
+                    items0 = upd0.get("result") or []
+                    max_id = None
+                    for it in items0 if isinstance(items0, list) else []:
+                        uid = it.get("update_id") if isinstance(it, dict) else None
+                        if isinstance(uid, int):
+                            max_id = uid if max_id is None else max(max_id, uid)
+                    if isinstance(max_id, int):
+                        offset = max_id + 1
                         print(f"[TG] drained backlog to offset={offset}", flush=True)
-        except Exception as ex:
-            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
-                print(f"[TG] drain backlog failed: {ex}", flush=True)
+            except Exception as ex:
+                if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                    print(f"[TG] drain backlog failed: {ex}", flush=True)
+        poll_err_streak = 0
+        last_poll_log_ts = time.time()
         while True:
             try:
-                upd = await asyncio.to_thread(client.get_updates, offset=offset, limit=20, timeout=0)
+                upd = await asyncio.to_thread(client.get_updates, offset=offset, limit=20, timeout=20)
                 if not (isinstance(upd, dict) and upd.get("ok")):
-                    await asyncio.sleep(1.5)
+                    poll_err_streak += 1
+                    desc = ""
+                    if isinstance(upd, dict):
+                        desc = str(upd.get("description") or "")
+                    if poll_err_streak <= 5 or (poll_err_streak % 10 == 0):
+                        print(f"TG bot: getUpdates failed (streak={poll_err_streak}): {desc or upd}", flush=True)
+                    if "409" in desc or "terminated by other getUpdates request" in desc.lower():
+                        print("TG bot: conflict detected. Another bot instance is consuming updates.", flush=True)
                     continue
+                if poll_err_streak > 0:
+                    print(f"TG bot: getUpdates recovered after {poll_err_streak} errors", flush=True)
+                poll_err_streak = 0
                 res = upd.get("result") or []
+                poll_state["last_batch_updates"] = len(res) if isinstance(res, list) else 0
+                if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                    now = time.time()
+                    if now - last_poll_log_ts >= 30:
+                        t = active_task.get("task")
+                        if t is None:
+                            task_state = "idle"
+                        elif t.done():
+                            task_state = "done"
+                        else:
+                            task_state = "running"
+                        print(
+                            f"[TG] poll heartbeat: offset={offset} last_update_id={poll_state.get('last_update_id')} "
+                            f"updates={poll_state.get('last_batch_updates')} queue_lag={poll_state.get('last_batch_updates')} "
+                            f"active_task={task_state}",
+                            flush=True,
+                        )
+                        last_poll_log_ts = now
+                if not res:
+                    continue
                 for item in res:
                     try:
                         update_id = item.get("update_id")
                         if update_id is not None:
                             offset = int(update_id) + 1
+                            poll_state["last_update_id"] = int(update_id)
                         msg = item.get("message") or item.get("edited_message") or {}
                         chat = msg.get("chat") or {}
                         chat_id = str(chat.get("id") or "")
                         text = (msg.get("text") or "").strip()
                         if not text:
                             continue
+                        text_norm = re.sub(r"\\s+", " ", text).strip().lower()
+                        text_cmd = _norm_cmd_text(text)
+                        # Debounce duplicate commands to reduce accidental double triggers.
+                        now_ts = time.time()
+                        last = last_cmd.get(chat_id)
+                        if debounce_ms > 0 and last and last[0] == text and (now_ts - last[1]) < (debounce_ms / 1000.0):
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print(f"[TG] debounce drop: {chat_id} text={text!r}", flush=True)
+                            continue
+                        last_cmd[chat_id] = (text, now_ts)
                         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                             uname = chat.get("username") or ""
                             print(f"[TG] msg from {chat_id} @{uname}: {text}", flush=True)
                         if text.startswith("/start"):
+                            _log_route(text, text_cmd, "start")
                             await send("Меню активировано.")
                             continue
                         if text.startswith("/analyze"):
+                            _log_route(text, text_cmd, "analyze_ids_slash")
                             parts = text.split()
                             ids = [int(x) for x in parts[1:] if x.isdigit()]
                             if not ids:
@@ -3270,7 +3673,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                     print(f"[TG] action: analyze_ids ids={ids}", flush=True)
                                     _set_active_task(asyncio.create_task(_analyze_ids(page, ids)))
                             continue
-                        if text == "Список live":
+                        if _cmd_eq_or_prefix(text_cmd, ("список live", "список лайв", "/live")):
+                            _log_route(text, text_cmd, "list_live")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: list_live", flush=True)
                             if active_task["task"] and not active_task["task"].done():
@@ -3278,7 +3682,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 continue
                             await _list_live(page)
                             continue
-                        if text == "Список upcoming":
+                        if _cmd_eq_or_prefix(text_cmd, ("список upcoming", "список предстоящих", "список предстоящие", "/upcoming")):
+                            _log_route(text, text_cmd, "list_upcoming")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: list_upcoming", flush=True)
                             if active_task["task"] and not active_task["task"].done():
@@ -3287,7 +3692,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             # default: show everything in the tab
                             await _list_upcoming(page, hours=None)
                             continue
-                        if text == "Анализ всех live":
+                        if _cmd_eq_or_prefix(text_cmd, ("анализ всех live", "анализ всех лайв", "/analyze_all")):
+                            _log_route(text, text_cmd, "analyze_all")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: analyze_all", flush=True)
                             if active_task["task"] and not active_task["task"].done():
@@ -3297,19 +3703,26 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 await send("Запускаю анализ всех live…")
                                 _set_active_task(asyncio.create_task(_analyze_all(page)))
                             continue
-                        if text == "Анализ upcoming":
+                        if _cmd_eq_or_prefix(text_cmd, ("анализ upcoming", "анализ предстоящих", "/analyze_upcoming")):
+                            _log_route(text, text_cmd, "analyze_upcoming_prompt")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: analyze_upcoming_prompt", flush=True)
                             pending_upcoming[chat_id] = True
-                            await send("Пришли окно в часах (например: 1 или 2). Я возьму upcoming матчи, которые начнутся в этом окне, и посчитаю по истории.")
+                            await asyncio.to_thread(
+                                client.send_text_result,
+                                "Выбери окно в часах: 1..10. Я возьму upcoming матчи, которые начнутся в этом окне, и посчитаю по истории.",
+                                reply_markup=upcoming_hours_markup,
+                            )
                             continue
-                        if text == "Анализ по ID":
+                        if _cmd_eq_or_prefix(text_cmd, ("анализ по id", "/analyze_id")):
+                            _log_route(text, text_cmd, "analyze_by_id_prompt")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: analyze_by_id_prompt", flush=True)
                             pending_id[chat_id] = True
                             await send("Пришли ID матча (число).")
                             continue
-                        if text == "Стоп текущий":
+                        if _cmd_eq_or_prefix(text_cmd, ("стоп текущий", "/stop")):
+                            _log_route(text, text_cmd, "stop_current")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: stop_current", flush=True)
                             stop_flag["stop"] = True
@@ -3322,13 +3735,15 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             active_task["task"] = None
                             await send("Остановил текущую задачу.")
                             continue
-                        if text == "Выключить бота":
+                        if _cmd_eq_or_prefix(text_cmd, ("выключить бота", "/shutdown")):
+                            _log_route(text, text_cmd, "shutdown_prompt")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print("[TG] action: stop_requested", flush=True)
                             pending_stop[chat_id] = True
                             await send("Подтверди выключение: отправь СТОП")
                             continue
-                        if text.strip().upper() == "СТОП" and pending_stop.get(chat_id):
+                        if text_norm == "стоп" and pending_stop.get(chat_id):
+                            _log_route(text, text_cmd, "shutdown_confirm")
                             pending_stop[chat_id] = False
                             stop_flag["stop"] = True
                             t = active_task.get("task")
@@ -3339,10 +3754,15 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                     pass
                             await send("Бот выключен.")
                             return 0
-                        if pending_stop.get(chat_id) and text.strip().upper() != "СТОП":
+                        if text_norm == "стоп" and not pending_stop.get(chat_id):
+                            _log_route(text, text_cmd, "stop_without_shutdown")
+                            await send("Для остановки текущей задачи нажми 'Стоп текущий'. Для выключения — 'Выключить бота' и затем СТОП.")
+                            continue
+                        if pending_stop.get(chat_id) and text_norm != "стоп":
                             pending_stop[chat_id] = False
                         if pending_id.get(chat_id):
-                            ids = [int(x) for x in re.findall(r"\\d+", text)]
+                            _log_route(text, text_cmd, "pending_id_value")
+                            ids = [int(x) for x in re.findall(r"\d+", text)]
                             if not ids:
                                 continue
                             pending_id[chat_id] = False
@@ -3355,10 +3775,15 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 _set_active_task(asyncio.create_task(_analyze_ids(page, ids)))
                             continue
                         if pending_upcoming.get(chat_id):
+                            if _cmd_eq_or_prefix(text_cmd, ("отмена", "cancel", "/cancel")):
+                                _log_route(text, text_cmd, "pending_upcoming_cancel")
+                                pending_upcoming[chat_id] = False
+                                await send("Отменено.")
+                                continue
                             hrs = None
                             try:
                                 raw_text = (text or "").strip()
-                                m = re.findall(r"\\d+(?:[\\.,]\\d+)?", raw_text)
+                                m = re.findall(r"\d+(?:[.,]\d+)?", raw_text)
                                 if m:
                                     hrs = float(m[0].replace(",", "."))
                             except Exception:
@@ -3366,26 +3791,125 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                                 print(f"[TG] upcoming input={text!r} parsed={hrs}", flush=True)
                             if hrs is None or hrs <= 0:
-                                await send("Не понял окно. Пришли число часов, например 1 или 2.")
+                                await send("Не понял окно. Выбери число часов от 1 до 10.")
+                                # keep pending to allow retry
+                                continue
+                            if hrs < 1 or hrs > 10:
+                                await send("Поддерживаются окна только 1..10 часов.")
                                 # keep pending to allow retry
                                 continue
                             pending_upcoming[chat_id] = False
                             if active_task["task"] and not active_task["task"].done():
                                 await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
                                 continue
+                            _log_route(text, text_cmd, "pending_upcoming_hours")
                             stop_flag["stop"] = False
                             await send("Запускаю анализ upcoming…")
                             print(f"[TG] action: analyze_upcoming hours={hrs}", flush=True)
                             _set_active_task(asyncio.create_task(_analyze_upcoming(page, hours=float(hrs))))
                             continue
+                        if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                            print(f"[TG] unhandled text: {text!r}", flush=True)
                     except Exception as ex:
                         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                             print(f"[TG] handler error: {ex}", flush=True)
                         continue
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.1)
             except Exception as ex:
                 print(f"TG bot: loop error: {ex}", flush=True)
                 await asyncio.sleep(2.0)
+
+    return await _with_browser(headless, run, profile_dir=profile_dir)
+
+
+async def cmd_probe_upcoming(*, hours: float, limit: int, headless: bool, profile_dir: Optional[str] = None) -> int:
+    async def run(page):
+        now = time.time()
+        horizon = now + max(0.25, float(hours)) * 3600.0
+        cards = await discover_upcoming_cards_dom(page, limit=None)
+        print(f"UPCOMING: cards_dom={len(cards)}", flush=True)
+        if not cards:
+            try:
+                print(f"UPCOMING: page title='{await page.title()}' url='{page.url}'", flush=True)
+            except Exception:
+                pass
+            return 0
+        # Raw sample helps verify DOM traversal before any filtering.
+        for c in cards[: min(12, int(limit))]:
+            eid = c.get("id")
+            st = c.get("startTimestamp")
+            status = str(c.get("status") or "").lower()
+            delta_min = None
+            if isinstance(st, int):
+                try:
+                    delta_min = int((int(st) - int(now)) // 60)
+                except Exception:
+                    delta_min = None
+            home = str(c.get("homeName") or c.get("home") or "—")
+            away = str(c.get("awayName") or c.get("away") or "—")
+            score = str(c.get("score") or "—")
+            print(
+                f"UPCOMING: RAW id={eid} {home} vs {away} | status={status or '-'} | "
+                f"start={st if isinstance(st, int) else '-'} | delta_min={delta_min if delta_min is not None else '-'} | score={score}",
+                flush=True,
+            )
+        status_breakdown: Dict[str, int] = {}
+        window_distribution: Dict[str, int] = {"inside_window": 0, "outside_window": 0, "past_start": 0, "no_start_time": 0}
+        skip_reasons: Dict[str, int] = {}
+        kept = 0
+        for c in cards:
+            if kept >= int(limit):
+                break
+            eid = c.get("id")
+            if not isinstance(eid, int):
+                skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
+                continue
+            st = c.get("startTimestamp")
+            status = str(c.get("status") or "").lower() or "unknown"
+            status_breakdown[status] = status_breakdown.get(status, 0) + 1
+            if not isinstance(st, int):
+                window_distribution["no_start_time"] = window_distribution.get("no_start_time", 0) + 1
+                skip_reasons["no_start_time"] = skip_reasons.get("no_start_time", 0) + 1
+                continue
+            if st < int(now):
+                window_distribution["past_start"] = window_distribution.get("past_start", 0) + 1
+                skip_reasons["scheduled_past_start"] = skip_reasons.get("scheduled_past_start", 0) + 1
+                continue
+            if st > horizon:
+                window_distribution["outside_window"] = window_distribution.get("outside_window", 0) + 1
+                skip_reasons["outside_window"] = skip_reasons.get("outside_window", 0) + 1
+                continue
+            window_distribution["inside_window"] = window_distribution.get("inside_window", 0) + 1
+            if not bool(c.get("isSingles")):
+                skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
+                continue
+            dpc = c.get("defaultPeriodCount")
+            if isinstance(dpc, int) and dpc != 3:
+                skip_reasons["not_bo3"] = skip_reasons.get("not_bo3", 0) + 1
+                continue
+            if status in ("finished", "inprogress"):
+                skip_reasons["status_not_upcoming"] = skip_reasons.get("status_not_upcoming", 0) + 1
+                continue
+            if status in ("canceled", "cancelled", "postponed"):
+                skip_reasons["status_not_upcoming"] = skip_reasons.get("status_not_upcoming", 0) + 1
+                continue
+            home = str(c.get("homeName") or c.get("home") or "—")
+            away = str(c.get("awayName") or c.get("away") or "—")
+            score = str(c.get("score") or "—")
+            print(f"UPCOMING: OK id={eid} {home} vs {away} | time/score={score} | status={status}", flush=True)
+            kept += 1
+
+        if status_breakdown:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(status_breakdown.items(), key=lambda kv: (-kv[1], kv[0])))
+            print(f"UPCOMING: raw_status_breakdown: {parts}", flush=True)
+        if window_distribution:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(window_distribution.items()))
+            print(f"UPCOMING: window_distribution: {parts}", flush=True)
+        print(f"UPCOMING: eligible_count={kept} (limit={int(limit)})", flush=True)
+        if skip_reasons:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items()))
+            print(f"UPCOMING: skipped reasons: {parts}", flush=True)
+        return 0
 
     return await _with_browser(headless, run, profile_dir=profile_dir)
 
@@ -3719,6 +4243,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_tg_bot = sub.add_parser("tg-bot", help="Run Telegram bot with menu buttons")
     p_tg_bot.add_argument("--max-history", type=int, default=5)
+    p_tg_bot.add_argument(
+        "--history-only",
+        action="store_true",
+        help="Use ONLY historical data (ignore current match statistics) for all TG bot analyses",
+    )
 
     p_probe = sub.add_parser("probe-stats", help="Probe statistics availability across live tennis matches")
     p_probe.add_argument("--limit", type=int, default=15)
@@ -3726,6 +4255,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_probe_dom = sub.add_parser("probe-dom", help="Probe DOM stats labels (find unmapped rows causing NA/—)")
     p_probe_dom.add_argument("--limit", type=int, default=8)
     p_probe_dom.add_argument("--seen", action="store_true", help="Also print all seen labels (not only unmapped)")
+
+    p_probe_up = sub.add_parser("probe-upcoming", help="Debug upcoming cards + filtering reasons")
+    p_probe_up.add_argument("--hours", type=float, default=24.0, help="Upcoming window in hours (default 24)")
+    p_probe_up.add_argument("--limit", type=int, default=20, help="Max cards to inspect (default 20)")
 
     args = parser.parse_args(argv)
     headless = not args.headed
@@ -3799,11 +4332,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "tg-updates":
         return asyncio.run(cmd_tg_updates(tg_token=args.tg_token, tg_chat=args.tg_chat, limit=args.limit))
     if args.cmd == "tg-bot":
-        return asyncio.run(cmd_tg_bot(max_history=args.max_history, headless=headless, profile_dir=profile_dir))
+        return asyncio.run(
+            cmd_tg_bot(
+                max_history=args.max_history,
+                headless=headless,
+                profile_dir=profile_dir,
+                history_only=args.history_only,
+            )
+        )
     if args.cmd == "probe-stats":
         return asyncio.run(cmd_probe_stats(limit=args.limit, headless=headless, profile_dir=profile_dir))
     if args.cmd == "probe-dom":
         return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless, profile_dir=profile_dir, seen=args.seen))
+    if args.cmd == "probe-upcoming":
+        return asyncio.run(cmd_probe_upcoming(hours=args.hours, limit=args.limit, headless=headless, profile_dir=profile_dir))
     raise SystemExit(2)
 
 
