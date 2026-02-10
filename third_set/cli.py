@@ -41,6 +41,33 @@ from third_set.tg_runtime import TelegramClient, get_telegram_config
 from third_set.dom_stats import extract_statistics_dom
 
 
+def _runtime_build_stamp() -> str:
+    """
+    Build stamp used in TG/debug output.
+    Uses the newest mtime among key runtime modules, not only cli.py,
+    so changes in analyzer/dom parser are visible immediately.
+    """
+    try:
+        base = Path(__file__).resolve().parent
+        newest_ts = 0
+        for name in ("cli.py", "analyzer.py", "dom_stats.py", "sofascore.py", "tg_runtime.py"):
+            p = base / name
+            if not p.exists():
+                continue
+            try:
+                newest_ts = max(newest_ts, int(p.stat().st_mtime))
+            except Exception:
+                continue
+        if newest_ts <= 0:
+            newest_ts = int(Path(__file__).stat().st_mtime)
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(newest_ts))
+    except Exception:
+        return ""
+
+
+_BUILD_STAMP = _runtime_build_stamp()
+
+
 def _print_audit(snapshot: MatchSnapshot) -> None:
     items = [
         ("Points", "Service points won"),
@@ -162,12 +189,7 @@ def _format_tg_message(
     meta: dict,
     mods: list,
 ) -> str:
-    # Small build stamp so we can confirm the bot runs the latest code.
-    try:
-        build_ts = int(Path(__file__).stat().st_mtime)
-        build = time.strftime("%Y-%m-%d %H:%M", time.localtime(build_ts))
-    except Exception:
-        build = ""
+    build = _BUILD_STAMP
     title = f"<b>{_html_escape(home_name)} vs {_html_escape(away_name)}</b>"
     link = f"<a href=\"{_html_escape(match_url)}\">Sofascore</a>"
     header = (
@@ -2130,11 +2152,16 @@ async def cmd_live(limit: int, history: int, headless: bool, *, profile_dir: Opt
         shown = 0
         scanned = 0
         skipped_not_live = 0
+        skipped_event_fetch = 0
         for link in match_links:
             event_id = parse_event_id_from_match_link(link)
             if not event_id:
                 continue
-            payload = await get_event_from_match_url_via_navigation(page, match_url=link, event_id=event_id)
+            try:
+                payload = await get_event_from_match_url_via_navigation(page, match_url=link, event_id=event_id)
+            except Exception:
+                skipped_event_fetch += 1
+                continue
             scanned += 1
             if not _is_live(payload):
                 skipped_not_live += 1
@@ -2156,7 +2183,9 @@ async def cmd_live(limit: int, history: int, headless: bool, *, profile_dir: Opt
                 break
         if shown == 0:
             print(
-                f"No live singles events after filtering. scanned={scanned} skipped_not_live={skipped_not_live} total_links={len(match_links)}"
+                "No live singles events after filtering. "
+                f"scanned={scanned} skipped_not_live={skipped_not_live} "
+                f"skipped_event_fetch={skipped_event_fetch} total_links={len(match_links)}"
             )
         return 0
 
@@ -2792,11 +2821,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         return 2
     client = TelegramClient(token=cfg.token, chat_id=cfg.chat_id)
     print(f"TG bot: chat_id={cfg.chat_id}", flush=True)
-    try:
-        build_ts = int(Path(__file__).stat().st_mtime)
-        build = time.strftime("%Y-%m-%d %H:%M", time.localtime(build_ts))
-    except Exception:
-        build = ""
+    build = _BUILD_STAMP
     session = time.strftime("%H:%M:%S")
 
     reply_markup = {
@@ -2828,19 +2853,24 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     last_analyze_failure: Dict[str, Optional[str]] = {"code": None}
     last_cmd: Dict[str, Tuple[str, float]] = {}
     poll_state: Dict[str, Any] = {"last_update_id": None, "last_batch_updates": 0}
+    upcoming_snapshot: Dict[str, Any] = {"ts": 0.0, "cards": []}
     try:
-        debounce_ms = int(os.getenv("THIRDSET_TG_DEBOUNCE_MS") or "300")
+        upcoming_snapshot_ttl_s = int(os.getenv("THIRDSET_UPCOMING_SNAPSHOT_TTL_S") or "90")
     except Exception:
-        debounce_ms = 300
+        upcoming_snapshot_ttl_s = 90
+    try:
+        debounce_ms = int(os.getenv("THIRDSET_TG_DEBOUNCE_MS") or "0")
+    except Exception:
+        debounce_ms = 0
     try:
         analyze_timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "240")
     except Exception:
         analyze_timeout_s = 240
     try:
-        analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "180")
+        analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "1200")
     except Exception:
-        analyze_timeout_hist_s = 180
-    no_limits_mode = os.getenv("THIRDSET_NO_LIMITS", "1").strip().lower() not in ("0", "false", "no")
+        analyze_timeout_hist_s = 1200
+    no_limits_mode = os.getenv("THIRDSET_NO_LIMITS", "0").strip().lower() not in ("0", "false", "no")
 
     async def send(text: str) -> None:
         # Optional debug prefix to detect “stale bot instance” issues.
@@ -2921,11 +2951,21 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             print(f"[TG] live(dom): cards={len(cards)}", flush=True)
         return cards
 
-    async def _get_upcoming_cards(page: Page) -> List[Dict[str, Any]]:
+    async def _get_upcoming_cards(page: Page, *, use_cache: bool = False) -> List[Dict[str, Any]]:
+        if use_cache:
+            ts = float(upcoming_snapshot.get("ts") or 0.0)
+            cached_cards = upcoming_snapshot.get("cards") or []
+            age = time.time() - ts
+            if cached_cards and age <= float(max(5, upcoming_snapshot_ttl_s)):
+                if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                    print(f"[TG] upcoming(dom): cards={len(cached_cards)} source=cache age={int(age)}s", flush=True)
+                return list(cached_cards)
         async with nav_lock:
             cards = await discover_upcoming_cards_dom(page, limit=None)
+        upcoming_snapshot["ts"] = time.time()
+        upcoming_snapshot["cards"] = list(cards)
         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
-            print(f"[TG] upcoming(dom): cards={len(cards)}", flush=True)
+            print(f"[TG] upcoming(dom): cards={len(cards)} source=fresh", flush=True)
         return cards
 
     def _fmt_start_local(st: Optional[int]) -> str:
@@ -2949,12 +2989,19 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             "not_bo3",
             "status_not_upcoming",
             "no_start_time",
+            "incomplete_event_data",
             "bad_card",
         ):
             v = skip_reasons.get(k, 0)
             if v:
                 parts.append(f"{k}={v}")
         return parts
+
+    def _is_upcoming_status(status: str) -> bool:
+        s = str(status or "").strip().lower()
+        if not s:
+            return False
+        return s in ("notstarted", "not_started", "scheduled")
 
     def _looks_like_doubles_card(card: Dict[str, Any]) -> bool:
         try:
@@ -3033,6 +3080,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         hours: float,
         max_items: Optional[int] = None,
         log_details: bool = False,
+        apply_window: bool = True,
     ) -> Dict[str, Any]:
         now = time.time()
         horizon = now + max(0.25, float(hours)) * 3600.0
@@ -3058,17 +3106,21 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 st = c.get("startTimestamp")
                 if status in ("inprogress", "finished", "canceled", "cancelled", "postponed"):
                     reason = "status_not_upcoming"
+                elif not _is_upcoming_status(status):
+                    reason = "incomplete_event_data" if not status else "status_not_upcoming"
                 elif not isinstance(st, int):
                     reason = "no_start_time"
                 elif st < int(now):
                     reason = "in_tab_but_past_start"
-                elif st > horizon:
+                elif apply_window and st > horizon:
                     reason = "outside_window"
                 elif c.get("isSingles") is False:
                     reason = "not_singles"
                 elif c.get("isSingles") is None and _looks_like_doubles_card(c):
                     # Hydration can occasionally miss isSingles; fallback to name pattern.
                     reason = "not_singles"
+                elif c.get("isSingles") is None:
+                    reason = "incomplete_event_data"
                 else:
                     dpc = c.get("defaultPeriodCount")
                     if isinstance(dpc, int) and dpc != 3:
@@ -3087,9 +3139,23 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
 
             item = {"event": _upcoming_event_from_card(c), "card": c}
             eligible.append(item)
-            if max_items is not None and len(eligible) >= int(max_items):
-                break
-        return {"eligible": eligible, "excluded": excluded, "skip_reasons": skip_reasons, "now": now, "horizon": horizon}
+        eligible.sort(
+            key=lambda it: (
+                int(((it.get("card") or {}).get("startTimestamp")) if isinstance((it.get("card") or {}).get("startTimestamp"), int) else 0),
+                int(((it.get("event") or {}).get("id")) if isinstance((it.get("event") or {}).get("id"), int) else 0),
+            )
+        )
+        eligible_total = len(eligible)
+        if max_items is not None:
+            eligible = eligible[: int(max_items)]
+        return {
+            "eligible": eligible,
+            "eligible_total": eligible_total,
+            "excluded": excluded,
+            "skip_reasons": skip_reasons,
+            "now": now,
+            "horizon": horizon,
+        }
 
     async def _list_live(page: Page) -> None:
         cards = await _get_live_cards(page)
@@ -3115,71 +3181,47 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             await send("Upcoming матчей не найдено.")
             return
         list_limit = 20
-        now = time.time()
-        horizon = now + (float(hours) * 3600.0) if isinstance(hours, (int, float)) and hours > 0 else None
-        skip_reasons: Dict[str, int] = {}
-        display_rows: List[Tuple[Tuple[int, int, int], str]] = []
-        seq = 0
-        for c in cards:
+        preview_hours = float(hours) if isinstance(hours, (int, float)) and hours > 0 else 2.0
+        list_norm = await _normalize_upcoming_for_analysis(
+            page,
+            cards,
+            hours=max(24.0, preview_hours),
+            max_items=None,
+            log_details=False,
+            apply_window=False,
+        )
+        analysis_norm = await _normalize_upcoming_for_analysis(
+            page,
+            cards,
+            hours=preview_hours,
+            max_items=None,
+            log_details=False,
+            apply_window=True,
+        )
+        display_rows: List[str] = []
+        for i, item in enumerate(list_norm.get("eligible") or [], 1):
+            if i > list_limit:
+                break
+            c = item.get("card") or {}
             eid = c.get("id")
-            if not isinstance(eid, int):
-                skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
-                continue
-            st = c.get("startTimestamp")
-            if not isinstance(st, int):
-                await _hydrate_upcoming_card(page, c)
-                st = c.get("startTimestamp")
-            status = str(c.get("status") or "").lower()
-            if isinstance(st, int) and horizon is not None and st > horizon:
-                skip_reasons["outside_window"] = skip_reasons.get("outside_window", 0) + 1
-                continue
-            is_singles = c.get("isSingles")
-            if is_singles is False or (is_singles is None and _looks_like_doubles_card(c)):
-                skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
-                continue
-            if not isinstance(st, int):
-                skip_reasons["no_start_time"] = skip_reasons.get("no_start_time", 0) + 1
             home = str(c.get("homeName") or c.get("home") or "—")
             away = str(c.get("awayName") or c.get("away") or "—")
-            start_s = _fmt_start_local(st if isinstance(st, int) else None)
-            flags: List[str] = []
-            if isinstance(st, int) and st < int(now):
-                flags.append("past_start_by_timestamp")
-            if status in ("inprogress", "finished", "canceled", "cancelled", "postponed"):
-                flags.append(f"status={status}")
-            if not bool(c.get("enriched")):
-                flags.append("enriched=no")
-            flag_s = f" [{', '.join(flags)}]" if flags else ""
-            row = f"{home} vs {away} | старт: {start_s} | id={eid}{flag_s}"
-            if isinstance(st, int):
-                if st >= int(now):
-                    sort_key = (0, int(st), seq)
-                else:
-                    sort_key = (1, int(st), seq)
-            else:
-                sort_key = (2, 0, seq)
-            display_rows.append((sort_key, row))
-            seq += 1
-        display_rows.sort(key=lambda x: x[0])
-        lines: List[str] = [f"{i}. {r}" for i, (_k, r) in enumerate(display_rows[:list_limit], 1)]
-        kept = len(lines)
+            start_s = _fmt_start_local(c.get("startTimestamp"))
+            display_rows.append(f"{i}. {home} vs {away} | старт: {start_s} | id={eid}")
+
+        kept = len(display_rows)
         header = f"Upcoming сейчас: сырых={len(cards)}, показано={kept}"
-        if horizon is not None:
+        if isinstance(hours, (int, float)) and hours > 0:
             header += f", окно={hours:g}ч"
-        preview_hours = float(hours) if isinstance(hours, (int, float)) and hours > 0 else 2.0
-        preview = await _normalize_upcoming_for_analysis(page, cards, hours=preview_hours, max_items=None, log_details=False)
-        eligible_preview = len(preview.get("eligible") or [])
-        parts: List[str] = []
-        for k in ("outside_window", "not_singles", "no_start_time", "bad_card"):
-            v = skip_reasons.get(k, 0)
-            if v:
-                parts.append(f"{k}={v}")
+        eligible_preview = len(analysis_norm.get("eligible") or [])
+        parts = _ordered_reason_parts(dict(analysis_norm.get("skip_reasons") or {}))
         extra = f"\nПричины пропуска: {', '.join(parts)}" if parts else ""
         potential_line = f"\nДля анализа в окне {preview_hours:g}ч потенциально подходят: {eligible_preview}"
-        await send(header + "\n" + ("\n".join(lines) if lines else "Нет матчей в выбранном окне.") + potential_line + extra)
+        await send(header + "\n" + ("\n".join(display_rows) if display_rows else "Нет подходящих одиночных upcoming матчей.") + potential_line + extra)
 
     async def _analyze_upcoming(page: Page, *, hours: float) -> None:
-        cards = await _get_upcoming_cards(page)
+        # Use a fresh DOM snapshot to keep "Список upcoming" and "Анализ upcoming" consistent.
+        cards = await _get_upcoming_cards(page, use_cache=False)
         try:
             max_upcoming_analyze = int(os.getenv("THIRDSET_UPCOMING_ANALYZE_LIMIT") or "40")
         except Exception:
@@ -3191,8 +3233,10 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             hours=float(hours),
             max_items=max_upcoming_analyze,
             log_details=True,
+            apply_window=True,
         )
         filtered: List[Dict[str, Any]] = list(norm.get("eligible") or [])
+        eligible_total = int(norm.get("eligible_total") or len(filtered))
         skip_reasons: Dict[str, int] = dict(norm.get("skip_reasons") or {})
 
         if not filtered:
@@ -3202,7 +3246,10 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             return
         parts = _ordered_reason_parts(skip_reasons)
         extra = f"\nПричины пропуска: " + ", ".join(parts) if parts else ""
-        await send(f"Запускаю анализ upcoming (окно {hours:g}ч)… матчей={len(filtered)}{extra}")
+        limit_note = ""
+        if eligible_total > len(filtered):
+            limit_note = f" (лимит {len(filtered)} из {eligible_total})"
+        await send(f"Запускаю анализ upcoming (окно {hours:g}ч)… матчей={len(filtered)}{limit_note}{extra}")
 
         ok = 0
         skipped = 0
@@ -3334,19 +3381,48 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             except Exception:
                 home, away, eid = "—", "—", ev.get("id")
             ex_text = str(ex or "").strip()
-            code = None
             lo = ex_text.lower()
             m = re.search(r"\bcode=([a-z0-9_]+)\b", lo)
-            if m:
-                code = m.group(1)
+            raw_code = m.group(1) if m else None
             if "timeout storm" in lo:
+                raw_code = "timeout_storm"
+            elif "503 backend read error" in lo and not raw_code:
+                raw_code = "varnish_503"
+            elif "profile_links_empty" in lo and not raw_code:
+                raw_code = "profile_links_empty"
+            elif "no_finished_singles" in lo and not raw_code:
+                raw_code = "no_finished_singles"
+
+            source_blocked_codes = {"varnish_503", "cloudflare_block", "source_blocked"}
+            stats_absent_codes = {
+                "stats_absent",
+                "profile_links_empty",
+                "no_finished_singles",
+                "stats_absent_likely",
+                "stats_panel_absent",
+                "stats_rows_absent",
+                "stats_not_provided",
+            }
+            stats_not_loaded_codes = {
+                "stats_not_loaded",
+                "statistics_tab_unreachable",
+                "consent_overlay_blocked",
+                "dom_extract_timeout",
+                "period_select_failed",
+                "scrape_eval_timeout",
+                "rows_not_ready",
+                "navigation_failed",
+                "api_history_fetch_failed",
+            }
+            code = raw_code
+            if raw_code in source_blocked_codes or "cloudflare" in lo or "503 backend read error" in lo:
+                code = "source_blocked"
+            elif raw_code == "timeout_storm":
                 code = "timeout_storm"
-            elif "503 backend read error" in lo:
-                code = "varnish_503"
-            elif "profile_links_empty" in lo:
-                code = "profile_links_empty"
-            elif "no_finished_singles" in lo:
-                code = "no_finished_singles"
+            elif raw_code in stats_absent_codes:
+                code = "stats_absent"
+            elif raw_code in stats_not_loaded_codes:
+                code = "stats_not_loaded"
             if code:
                 # Avoid duplicating "code=..." in the next line: keep code only in code_line.
                 ex_text = re.sub(r"\bcode=[a-z0-9_]+\b\s*", "", ex_text, flags=re.I).strip()
@@ -3428,6 +3504,16 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         print(f"[TG] analyze_all: id={eid} event_fetch_failed: {type(ex).__name__}: {ex}", flush=True)
                     continue
                 ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                status_type = str(((ev.get("status") or {}).get("type")) or "").strip().lower()
+                if status_type and status_type != "inprogress":
+                    skipped += 1
+                    skip_reasons["not_live_status"] = skip_reasons.get("not_live_status", 0) + 1
+                    if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                        print(
+                            f"[TG] analyze_all: id={eid} skip not_live_status={status_type}",
+                            flush=True,
+                        )
+                    continue
                 if not is_singles_event(ev):
                     skipped += 1
                     skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
@@ -3467,7 +3553,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             dt = int(time.time() - started)
             # Compact, but actionable: show why we skipped.
             parts: List[str] = []
-            for k in ("bad_card", "event_fetch_failed", "not_singles", "not_bo3", "analyze_failed", "exception"):
+            for k in ("bad_card", "event_fetch_failed", "not_live_status", "not_singles", "not_bo3", "analyze_failed", "exception"):
                 v = skip_reasons.get(k, 0)
                 if v:
                     parts.append(f"{k}={v}")
@@ -3589,6 +3675,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                     print(f"[TG] drain backlog failed: {ex}", flush=True)
         poll_err_streak = 0
+        poll_recovered_count = 0
+        poll_last_success_ts = time.time()
         last_poll_log_ts = time.time()
         while True:
             try:
@@ -3602,10 +3690,13 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                         print(f"TG bot: getUpdates failed (streak={poll_err_streak}): {desc or upd}", flush=True)
                     if "409" in desc or "terminated by other getUpdates request" in desc.lower():
                         print("TG bot: conflict detected. Another bot instance is consuming updates.", flush=True)
+                    await asyncio.sleep(0.6)
                     continue
                 if poll_err_streak > 0:
                     print(f"TG bot: getUpdates recovered after {poll_err_streak} errors", flush=True)
+                    poll_recovered_count += 1
                 poll_err_streak = 0
+                poll_last_success_ts = time.time()
                 res = upd.get("result") or []
                 poll_state["last_batch_updates"] = len(res) if isinstance(res, list) else 0
                 if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
@@ -3618,10 +3709,12 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             task_state = "done"
                         else:
                             task_state = "running"
+                        last_success_ago = int(max(0.0, now - poll_last_success_ts))
                         print(
                             f"[TG] poll heartbeat: offset={offset} last_update_id={poll_state.get('last_update_id')} "
                             f"updates={poll_state.get('last_batch_updates')} queue_lag={poll_state.get('last_batch_updates')} "
-                            f"active_task={task_state}",
+                            f"active_task={task_state} err_streak={poll_err_streak} "
+                            f"recovered={poll_recovered_count} last_success_s_ago={last_success_ago}",
                             flush=True,
                         )
                         last_poll_log_ts = now
@@ -4243,6 +4336,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_tg_bot = sub.add_parser("tg-bot", help="Run Telegram bot with menu buttons")
     p_tg_bot.add_argument("--max-history", type=int, default=5)
+    # Convenience: allow these flags after subcommand as users commonly type
+    # `... tg-bot --headed --profile-dir ...`.
+    p_tg_bot.add_argument("--headed", action="store_true", dest="tg_headed", help="Run headed browser for tg-bot")
+    p_tg_bot.add_argument("--profile-dir", type=str, default=None, dest="tg_profile_dir", help="Persistent profile dir for tg-bot")
     p_tg_bot.add_argument(
         "--history-only",
         action="store_true",
@@ -4265,6 +4362,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     profile_dir = (args.profile_dir or "").strip() or None
     # tg-bot should be максимально устойчивым: headed + persistent profile by default.
     if args.cmd == "tg-bot":
+        if bool(getattr(args, "tg_headed", False)):
+            headless = False
+        tg_profile_dir = (getattr(args, "tg_profile_dir", "") or "").strip() or None
+        if tg_profile_dir:
+            profile_dir = tg_profile_dir
         if not os.getenv("THIRDSET_FORCE_HEADLESS"):
             headless = False
         if profile_dir is None:

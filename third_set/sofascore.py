@@ -520,14 +520,23 @@ async def get_live_match_links(page: Page, *, limit: Optional[int] = None) -> Li
 
     Each URL includes a synthetic fragment `#id:<eventId>` so callers can recover the event id.
     """
-    # Single source of truth: tennis page DOM, tab "Сейчас (N)".
-    # We do NOT filter by API status here: the user wants "exactly what the UI shows".
-    # Filtering (BO3/singles/inprogress) is done later by the caller when needed.
+    # Use normalized live cards to avoid mixed links from other tabs/blocks.
+    # discover_live_cards_dom already keeps only live candidates and preserves UI order.
     hrefs: List[str] = []
     try:
-        hrefs = await discover_match_links(page, limit=limit)
+        cards = await discover_live_cards_dom(page, limit=limit)
     except Exception:
-        hrefs = []
+        cards = []
+    for c in cards:
+        if not isinstance(c, dict):
+            continue
+        eid = c.get("id")
+        url = c.get("url")
+        if not isinstance(eid, int):
+            continue
+        if not isinstance(url, str) or not url:
+            continue
+        hrefs.append(f"{url}#id:{int(eid)}")
     out: List[str] = []
     seen: set = set()
     for href in hrefs:
@@ -1022,7 +1031,7 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
                       if (liveBtn) {{
                         let cur = liveBtn.parentElement;
                         while (cur) {{
-                          const n = cur.querySelectorAll('a[href*="/tennis/match/"][href*="#id:"]').length;
+                          const n = cur.querySelectorAll('a[href*="/tennis/match/"][href*=\"#id:\"]').length;
                           if (n >= 5) {{ root = cur; break; }}
                           cur = cur.parentElement;
                         }}
@@ -1041,6 +1050,90 @@ async def discover_match_links(page: Page, *, limit: Optional[int] = None, tab: 
             await page.wait_for_timeout(450)
     except Exception:
         pass
+    # Fallback: brute-force scroll to bottom to catch lower leagues rendered outside the main container.
+    try:
+        prev_h = 0
+        for _ in range(60):
+            h = await page.evaluate("() => document.body.scrollHeight")
+            if h <= prev_h + 16:
+                break
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(320)
+            prev_h = h
+            new_hrefs = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"][href*=\"#id:\"]'))
+                      .map(a => a.getAttribute('href'))
+                      .filter(Boolean)"""
+            )
+            if isinstance(new_hrefs, list):
+                for h in new_hrefs:
+                    if not isinstance(h, str) or not h:
+                        continue
+                    if h in seen_hrefs:
+                        continue
+                    seen_hrefs.add(h)
+                    collected_hrefs.append(h)
+    except Exception:
+        pass
+    # Additional fallback: some lower-league blocks are rendered in nested scroll containers
+    # and are not reached by plain window scroll. Push every visible scrollable down and re-collect.
+    try:
+        need_more = expected_n is not None and len(collected_hrefs) < int(expected_n)
+    except Exception:
+        need_more = False
+    if need_more:
+        try:
+            stalled_nested = 0
+            for _ in range(40):
+                await page.evaluate(
+                    """
+                    () => {
+                      function isVisible(el) {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        const r = el.getClientRects();
+                        return !!(r && r.length && r[0].width > 1 && r[0].height > 1);
+                      }
+                      const nodes = Array.from(document.querySelectorAll('*'));
+                      for (const el of nodes) {
+                        try {
+                          if (!isVisible(el)) continue;
+                          if (el.scrollHeight > el.clientHeight + 20) {
+                            el.scrollTop = el.scrollHeight;
+                          }
+                        } catch (e) {}
+                      }
+                      try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+                    }
+                    """
+                )
+                await page.wait_for_timeout(260)
+                new_hrefs = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll('a[href*="/tennis/match/"][href*="#id:"]'))
+                          .map(a => a.getAttribute('href'))
+                          .filter(Boolean)"""
+                )
+                added = 0
+                if isinstance(new_hrefs, list):
+                    for h in new_hrefs:
+                        if not isinstance(h, str) or not h:
+                            continue
+                        if h in seen_hrefs:
+                            continue
+                        seen_hrefs.add(h)
+                        collected_hrefs.append(h)
+                        added += 1
+                if added == 0:
+                    stalled_nested += 1
+                else:
+                    stalled_nested = 0
+                if expected_n is not None and len(collected_hrefs) >= int(expected_n):
+                    break
+                if stalled_nested >= 8:
+                    break
+        except Exception:
+            pass
     if not hrefs:
         hrefs = await page.evaluate(
             """() => Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"][href*=\"#id:\"]'))\n              .map(a => a.getAttribute('href'))\n              .filter(Boolean)"""
@@ -1124,137 +1217,343 @@ async def discover_live_cards_dom(page: Page, *, limit: Optional[int] = None) ->
     links = await discover_match_links(page, limit=limit, tab="live")
     if not links:
         return []
-    allowed_ids: List[int] = []
-    allowed_set: set = set()
+
+    # Keep link order from DOM list, but don't depend on current visibility:
+    # virtualized rows can disappear from viewport after scrolling.
+    out: List[Dict[str, Any]] = []
+    seen_ids: set = set()
     for u in links:
         eid = parse_event_id_from_match_link(str(u))
-        if isinstance(eid, int):
-            allowed_ids.append(eid)
-            allowed_set.add(eid)
-
-    # We already scrolled inside discover_match_links.
-    # Build one card per id from the anchor matching "#id:<eventId>".
-    try:
-        cards = await page.evaluate(
-            """
-            (allowedIds) => {
-              function norm(s){
-                return (s || '')
-                  .replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g, ' ')
-                  .replace(/\\s+/g, ' ')
-                  .trim();
-              }
-              function isVisible(el) {
-                if (!el) return false;
-                const st = window.getComputedStyle(el);
-                if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
-                const r = el.getClientRects();
-                if (!r || r.length === 0) return false;
-                const box = r[0];
-                return (box.width > 1 && box.height > 1);
-              }
-              function findRoot() {
-                const want = /^(Сейчас|Live)\\s*\\(\\d+\\)\\s*$/i;
-                const candidates = Array.from(document.querySelectorAll('button')).filter(b => want.test((b.innerText||b.textContent||'').trim()));
-                let liveBtn = null;
-                for (const b of candidates) {
-                  const p = (b.parentElement && (b.parentElement.innerText || b.parentElement.textContent) || '').toLowerCase();
-                  if ((p.includes('законч') || p.includes('finished')) && (p.includes('предстоящ') || p.includes('upcoming'))) {
-                    liveBtn = b; break;
-                  }
-                }
-                if (!liveBtn) {
-                  liveBtn = Array.from(document.querySelectorAll('button[aria-selected=\"true\"]'))
-                    .find(b => want.test((b.innerText||b.textContent||'').trim())) || candidates[0] || null;
-                }
-                if (!liveBtn) return document;
-                let tabsRoot = liveBtn.parentElement;
-                while (tabsRoot && tabsRoot.querySelectorAll('button').length < 2) tabsRoot = tabsRoot.parentElement;
-                const main = (tabsRoot && tabsRoot.closest('main')) || document.body;
-                let best = null;
-                let bestN = 0;
-                const walker = document.createTreeWalker(main, NodeFilter.SHOW_ELEMENT);
-                let started = false;
-                while (walker.nextNode()) {
-                  const el = walker.currentNode;
-                  if (el === tabsRoot) { started = true; continue; }
-                  if (!started) continue;
-                  const links = Array.from(el.querySelectorAll('a[href*=\"/tennis/match/\"][href*=\"#id:\"]')).filter(isVisible);
-                  const n = links.length;
-                  if (n > bestN) { bestN = n; best = el; }
-                  if (bestN >= 10) break;
-                }
-                return best || tabsRoot || main;
-              }
-              const root = findRoot() || document;
-              const res = [];
-              for (const id of (allowedIds || [])) {
-                const sel = `a[href*=\"/tennis/match/\"][href*=\"#id:${id}\"]`;
-                let a = Array.from(root.querySelectorAll(sel)).find(isVisible) || null;
-                // Fallback: root detection can miss the virtualized list on some layouts;
-                // try the whole document before giving up.
-                if (!a) {
-                  a = Array.from(document.querySelectorAll(sel)).find(isVisible) || null;
-                }
-                if (!a) continue;
-                const href = a.getAttribute('href') || '';
-                const urlAbs = a.href || (location.origin + href);
-                const url = urlAbs.split('#')[0];
-                const raw = norm(a.innerText || a.textContent || '');
-                let home = null;
-                let away = null;
-                const rawLines = raw.split('\\n').map(norm).filter(Boolean);
-                const nameLines = rawLines
-                  .filter(t => /[A-Za-zА-Яа-яЁё]/.test(t))
-                  .filter(t => !/^\\d{1,2}:\\d{2}$/.test(t))
-                  .filter(t => !/^(ПВ|LIVE|Finished|Закончил(ся|ась)?|Сейчас|Now)$/i.test(t))
-                  .filter(t => !/^\\d+(-\\d+)*$/.test(t))
-                  .filter(t => !/(сет|set)$/i.test(t));
-                if (nameLines.length >= 2) {
-                  home = nameLines[0];
-                  away = nameLines[1];
-                }
-                const scoreRoot =
-                  a.querySelector('div.d_flex.flex-d_column.ai_flex-end') ||
-                  a.querySelector('div[class*=\"ai_flex-end\"][class*=\"flex-d_column\"]') ||
-                  null;
-                const score = scoreRoot ? norm(scoreRoot.textContent) : null;
-                if (!url) continue;
-                res.push({ id, url, home, away, score });
-              }
-              return res;
+        if not isinstance(eid, int) or eid in seen_ids:
+            continue
+        seen_ids.add(eid)
+        url0 = str(u).split("#", 1)[0]
+        h0, a0 = _names_from_match_url(url0)
+        out.append(
+            {
+                "id": int(eid),
+                "url": url0,
+                "home": h0,
+                "away": a0,
+                "score": None,
+                "status": None,
+                "enriched": False,
             }
-            """,
-            allowed_ids,
         )
-    except Exception:
-        cards = []
-    if not isinstance(cards, list):
+    if not out:
         return []
-    out: List[Dict[str, Any]] = []
-    out_ids: set = set()
-    for c in cards:
-        if not isinstance(c, dict):
+
+    def _live_hint_rank(score: Any, raw: Any) -> int:
+        txt = f"{score or ''} {raw or ''}".strip().lower()
+        if not txt:
+            return 0
+        if any(x in txt for x in ("ft", "finished", "walkover", "retired", "cancel", "postponed", "end of day")):
+            return 0
+        if "set" in txt or "started" in txt or "live" in txt:
+            return 3
+        if re.search(r"\b(15|30|40|ad)\b", txt):
+            return 2
+        if re.search(r"\b\d+\s*:\s*\d+\b", txt):
+            return 2
+        if re.search(r"\b\d{4,}\b", str(score or "").lower()):
+            return 1
+        return 0
+
+    # Collect visible rows across scroll to avoid losing cards due virtualized rendering.
+    visible_by_id: Dict[int, Dict[str, Any]] = {}
+    allowed_ids = [int(x.get("id")) for x in out if isinstance(x.get("id"), int)]
+    try:
+        await page.evaluate("() => { try { window.scrollTo(0, 0); } catch(e) {} }")
+    except Exception:
+        pass
+    stalled_meta = 0
+    for _ in range(120):
+        try:
+            visible_cards = await page.evaluate(
+                """
+                (allowedIds) => {
+                  function norm(s){
+                    return (s || '')
+                      .replace(/[\\u00a0\\u200b\\u200c\\u200d\\ufeff]/g, ' ')
+                      .replace(/\\s+/g, ' ')
+                      .trim();
+                  }
+                  function isVisible(el) {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                    if (el.closest('[aria-hidden=\"true\"], [hidden], [inert]')) return false;
+                    const r = el.getClientRects();
+                    if (!r || r.length === 0) return false;
+                    const box = r[0];
+                    if (!(box.width > 1 && box.height > 1)) return false;
+                    if (box.bottom < 0 || box.top > window.innerHeight) return false;
+                    if (box.right < 0 || box.left > window.innerWidth) return false;
+                    return true;
+                  }
+                  const allowed = new Set((allowedIds || []).map((x) => Number(x)));
+                  const res = [];
+                  const anchors = Array.from(document.querySelectorAll('a[href*=\"/tennis/match/\"][href*=\"#id:\"]')).filter(isVisible);
+                  for (const a of anchors) {
+                    const href = a.getAttribute('href') || '';
+                    const m = href.match(/#id:(\\d+)/);
+                    if (!m) continue;
+                    const id = Number(m[1]);
+                    if (!Number.isFinite(id) || !allowed.has(id)) continue;
+                    const raw = norm(a.innerText || a.textContent || '');
+                    let home = null;
+                    let away = null;
+                    const rawLines = raw.split('\\n').map(norm).filter(Boolean);
+                    const nameLines = rawLines
+                      .filter(t => /[A-Za-zА-Яа-яЁё]/.test(t))
+                      .filter(t => !/^\\d{1,2}:\\d{2}$/.test(t))
+                      .filter(t => !/^(ПВ|LIVE|Finished|Закончил(ся|ась)?|Сейчас|Now|All|Всё)$/i.test(t))
+                      .filter(t => !/^\\d+(-\\d+)*$/.test(t))
+                      .filter(t => !/(сет|set)$/i.test(t));
+                    if (nameLines.length >= 2) {
+                      home = nameLines[0];
+                      away = nameLines[1];
+                    }
+                    const scoreRoot =
+                      a.querySelector('div.d_flex.flex-d_column.ai_flex-end') ||
+                      a.querySelector('div[class*=\"ai_flex-end\"][class*=\"flex-d_column\"]') ||
+                      null;
+                    const score = scoreRoot ? norm(scoreRoot.textContent) : null;
+                    res.push({ id, home, away, score, raw });
+                  }
+                  return res;
+                }
+                """,
+                allowed_ids,
+            )
+        except Exception:
+            visible_cards = []
+
+        added_now = 0
+        if isinstance(visible_cards, list):
+            for c in visible_cards:
+                if not isinstance(c, dict):
+                    continue
+                eid = c.get("id")
+                if not isinstance(eid, int):
+                    continue
+                prev = visible_by_id.get(int(eid))
+                cur_rank = _live_hint_rank(c.get("score"), c.get("raw"))
+                prev_rank = _live_hint_rank((prev or {}).get("score"), (prev or {}).get("raw")) if isinstance(prev, dict) else -1
+                if prev is None or cur_rank > prev_rank:
+                    visible_by_id[int(eid)] = c
+                    added_now += 1
+                elif isinstance(prev, dict):
+                    if not prev.get("home") and c.get("home"):
+                        prev["home"] = c.get("home")
+                    if not prev.get("away") and c.get("away"):
+                        prev["away"] = c.get("away")
+                    if not prev.get("raw") and c.get("raw"):
+                        prev["raw"] = c.get("raw")
+                    if not prev.get("score") and c.get("score"):
+                        prev["score"] = c.get("score")
+        if len(visible_by_id) >= len(allowed_ids):
+            break
+        if added_now == 0:
+            stalled_meta += 1
+        else:
+            stalled_meta = 0
+        if stalled_meta >= 14:
+            break
+        try:
+            await page.evaluate("() => window.scrollBy(0, Math.max(900, window.innerHeight * 0.85))")
+        except Exception:
+            pass
+        try:
+            await page.wait_for_timeout(220)
+        except Exception:
+            pass
+
+    for row in out:
+        vis = visible_by_id.get(int(row.get("id")))
+        if not isinstance(vis, dict):
             continue
-        eid = c.get("id")
-        if not isinstance(eid, int) or eid not in allowed_set:
+        if vis.get("raw"):
+            row["raw"] = vis.get("raw")
+        if vis.get("home"):
+            row["home"] = vis.get("home")
+        if vis.get("away"):
+            row["away"] = vis.get("away")
+        if vis.get("score"):
+            row["score"] = vis.get("score")
+
+    # Fast bulk enrichment from live API snapshot (status + canonical names).
+    # Prefer navigation-captured API; fallback to in-page fetch when capture misses.
+    live_by_id: Dict[int, Dict[str, Any]] = {}
+    try:
+        events = await get_live_events_via_navigation(page, timeout_ms=12_000)
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            eid = ev.get("id")
+            if not isinstance(eid, int):
+                continue
+            live_by_id[int(eid)] = ev
+    except Exception:
+        live_by_id = {}
+    if not live_by_id:
+        try:
+            events = await get_live_events(page)
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                eid = ev.get("id")
+                if not isinstance(eid, int):
+                    continue
+                live_by_id[int(eid)] = ev
+        except Exception:
+            live_by_id = {}
+
+    # Optional per-event fallback hydration for a small subset when names/status are missing.
+    try:
+        fallback_fetch_max = int(os.getenv("THIRDSET_LIVE_FALLBACK_FETCH_MAX") or "24")
+    except Exception:
+        fallback_fetch_max = 12
+    fallback_fetch_max = max(0, min(80, fallback_fetch_max))
+
+    for row in out:
+        eid = int(row.get("id"))
+        ev = live_by_id.get(eid)
+        if isinstance(ev, dict):
+            row["status"] = str(((ev.get("status") or {}).get("type")) or "").lower() or row.get("status")
+            row["defaultPeriodCount"] = ev.get("defaultPeriodCount")
+            row["isSingles"] = bool(is_singles_event(ev))
+            if isinstance(ev.get("homeTeam"), dict):
+                row["home"] = (ev.get("homeTeam") or {}).get("name") or row.get("home")
+            if isinstance(ev.get("awayTeam"), dict):
+                row["away"] = (ev.get("awayTeam") or {}).get("name") or row.get("away")
+            row["slug"] = ev.get("slug")
+            row["customId"] = ev.get("customId")
+            row["enriched"] = True
             continue
-        row = dict(c)
-        # Fill names from URL slug as a weak fallback.
-        if not (row.get("home") and row.get("away")):
-            h0, a0 = _names_from_match_url(str(row.get("url") or ""))
-            if h0 and not row.get("home"):
-                row["home"] = h0
-            if a0 and not row.get("away"):
-                row["away"] = a0
-        # For TG "Список live" we intentionally mirror the selected DOM tab.
-        # Do not re-filter by API status here; DOM tab selection is the source of truth.
-        row["status"] = str(row.get("status") or "dom_live")
-        if eid in out_ids:
+
+        if fallback_fetch_max <= 0:
             continue
-        out_ids.add(eid)
-        out.append(row)
-    return out
+        if row.get("home") and row.get("away") and row.get("status"):
+            continue
+        try:
+            payload = await get_event_via_navigation(page, int(eid), timeout_ms=8_000)
+            ev2 = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+            if isinstance(ev2, dict) and ev2:
+                row["status"] = str(((ev2.get("status") or {}).get("type")) or "").lower() or row.get("status")
+                row["defaultPeriodCount"] = ev2.get("defaultPeriodCount")
+                row["isSingles"] = bool(is_singles_event(ev2))
+                if isinstance(ev2.get("homeTeam"), dict):
+                    row["home"] = (ev2.get("homeTeam") or {}).get("name") or row.get("home")
+                if isinstance(ev2.get("awayTeam"), dict):
+                    row["away"] = (ev2.get("awayTeam") or {}).get("name") or row.get("away")
+                row["slug"] = ev2.get("slug")
+                row["customId"] = ev2.get("customId")
+                row["enriched"] = True
+        except Exception:
+            pass
+        finally:
+            fallback_fetch_max -= 1
+
+    # If live API snapshot is available, treat it as canonical for membership:
+    # this prevents accidental leakage of finished/upcoming cards from mixed DOM blocks.
+    if live_by_id:
+        filtered: List[Dict[str, Any]] = []
+        seen_live_ids: set = set()
+        base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+
+        for row in out:
+            eid = row.get("id")
+            if not isinstance(eid, int):
+                continue
+            ev = live_by_id.get(int(eid))
+            if not isinstance(ev, dict):
+                continue
+            status = str(((ev.get("status") or {}).get("type")) or "").strip().lower()
+            if status and status != "inprogress":
+                continue
+            if status:
+                row["status"] = status
+            if not row.get("url"):
+                slug = ev.get("slug")
+                custom = ev.get("customId")
+                if slug and custom:
+                    row["url"] = f"{base}/tennis/match/{slug}/{custom}"
+                else:
+                    row["url"] = f"{base}/event/{int(eid)}"
+            seen_live_ids.add(int(eid))
+            filtered.append(row)
+
+        # Add live events that DOM scrolling missed (often lower-tier leagues below viewport chunks).
+        for eid, ev in live_by_id.items():
+            if int(eid) in seen_live_ids:
+                continue
+            status = str(((ev.get("status") or {}).get("type")) or "").strip().lower()
+            if status and status != "inprogress":
+                continue
+            slug = ev.get("slug")
+            custom = ev.get("customId")
+            url = f"{base}/tennis/match/{slug}/{custom}" if (slug and custom) else f"{base}/event/{int(eid)}"
+            filtered.append(
+                {
+                    "id": int(eid),
+                    "url": url,
+                    "home": str(((ev.get("homeTeam") or {}).get("name")) or "") or None,
+                    "away": str(((ev.get("awayTeam") or {}).get("name")) or "") or None,
+                    "score": None,
+                    "status": status or "inprogress",
+                    "defaultPeriodCount": ev.get("defaultPeriodCount"),
+                    "isSingles": bool(is_singles_event(ev)),
+                    "slug": ev.get("slug"),
+                    "customId": ev.get("customId"),
+                    "enriched": True,
+                }
+            )
+
+        if limit is not None:
+            filtered = filtered[: max(0, int(limit))]
+        return filtered
+
+    # Fallback path when live API snapshot is unavailable: use strict score/status hints.
+    def _looks_live_hint(row: Dict[str, Any]) -> bool:
+        score = str(row.get("score") or "").strip().lower()
+        raw = str(row.get("raw") or "").strip().lower()
+        txt = f"{score} {raw}".strip()
+        if not txt:
+            return False
+        if score in ("-", "—", ""):
+            return False
+        if re.fullmatch(r"\d{1,2}:\d{2}", score):
+            # HH:MM is usually a start time (upcoming), not live score.
+            return False
+        if any(
+            x in txt
+            for x in (
+                "ft",
+                "finished",
+                "walkover",
+                "retired",
+                "cancel",
+                "postponed",
+                "end of day",
+                "ended",
+                "not started",
+            )
+        ):
+            return False
+        return _live_hint_rank(score, raw) >= 2
+
+    filtered: List[Dict[str, Any]] = []
+    for row in out:
+        status = str(row.get("status") or "").lower().strip()
+        if status and status != "inprogress":
+            continue
+        if not status and not _looks_live_hint(row):
+            continue
+        filtered.append(row)
+    if limit is not None:
+        filtered = filtered[: max(0, int(limit))]
+    return filtered
 
 
 async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:

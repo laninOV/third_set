@@ -63,6 +63,11 @@ try:
     _HUMAN_PAUSE_MS = int(os.getenv("THIRDSET_HUMAN_PAUSE_MS", "0"))
 except Exception:
     _HUMAN_PAUSE_MS = 0
+try:
+    _DOM_READY_POLL_MS = int(os.getenv("THIRDSET_DOM_READY_POLL_MS", "180"))
+except Exception:
+    _DOM_READY_POLL_MS = 180
+_DOM_READY_POLL_MS = max(80, min(600, _DOM_READY_POLL_MS))
 
 
 def _dbg(msg: str) -> None:
@@ -70,7 +75,7 @@ def _dbg(msg: str) -> None:
         print(f"[dom] {msg}", flush=True)
 
 
-_NO_LIMITS_MODE = os.getenv("THIRDSET_NO_LIMITS", "1").strip().lower() not in ("0", "false", "no")
+_NO_LIMITS_MODE = os.getenv("THIRDSET_NO_LIMITS", "0").strip().lower() not in ("0", "false", "no")
 
 
 async def _safe_goto(page: Page, url: str, *, timeout_ms: int) -> None:
@@ -210,6 +215,64 @@ async def _is_cloudflare_block(page: Page) -> bool:
     return False
 
 
+async def _consent_overlay_block_state(page: Page) -> Dict[str, Any]:
+    """
+    Detect whether consent/captcha overlays are still intercepting interactions.
+    """
+    try:
+        state = await page.evaluate(
+            """
+            () => {
+              function vis(el) {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 1 && r.height > 1;
+              }
+              const sels = ['.fc-consent-root', '#fc-consent-root', '#onetrust-banner-sdk', '.fc-dialog-overlay'];
+              let root = null;
+              let selector = null;
+              for (const s of sels) {
+                const el = document.querySelector(s);
+                if (vis(el)) {
+                  root = el;
+                  selector = s;
+                  break;
+                }
+              }
+              const recaptchaVisible = Array.from(document.querySelectorAll('iframe[src*=\"recaptcha\"]')).some((fr) => {
+                if (!fr) return false;
+                const st = window.getComputedStyle(fr);
+                if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = fr.getBoundingClientRect();
+                return r.width > 8 && r.height > 8;
+              });
+              if (!root) {
+                return { blocked: false, visible: false, recaptcha: recaptchaVisible };
+              }
+              const st = window.getComputedStyle(root);
+              const r = root.getBoundingClientRect();
+              const blocks = (st.pointerEvents || '').toLowerCase() !== 'none' && r.width > 120 && r.height > 120;
+              const text = (root.innerText || root.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 220);
+              return {
+                blocked: Boolean(blocks || (recaptchaVisible && r.width > 120 && r.height > 120)),
+                visible: true,
+                selector: selector || '',
+                pointerEvents: st.pointerEvents || '',
+                width: Math.round(r.width || 0),
+                height: Math.round(r.height || 0),
+                recaptcha: Boolean(recaptchaVisible),
+                text,
+              };
+            }
+            """
+        )
+        return state if isinstance(state, dict) else {"blocked": False, "visible": False}
+    except Exception:
+        return {"blocked": False, "visible": False}
+
+
 async def _wait_for_stats_rows(page: Page, *, timeout_ms: int) -> bool:
     """
     Wait until stats rows (or headers) are present in DOM.
@@ -228,10 +291,62 @@ async def _wait_for_stats_rows(page: Page, *, timeout_ms: int) -> bool:
             }
             """,
             timeout=timeout_ms,
+            polling=_DOM_READY_POLL_MS,
         )
         return True
     except Exception:
         return False
+
+
+async def _probe_stats_availability(page: Page) -> Dict[str, Any]:
+    try:
+        return await page.evaluate(
+            """
+            () => {
+              function norm(s){return (s||'').replace(/\\s+/g,' ').trim();}
+              function low(s){return norm(s).toLowerCase();}
+              function isVisible(el) {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (!st || st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = el.getClientRects();
+                return !!(r && r.length && r[0].width > 1 && r[0].height > 1);
+              }
+              const root = document.querySelector('#tabpanel-statistics') || document;
+              const texts = Array.from(root.querySelectorAll('button,a,[role="tab"],[role="button"],[role="link"],div,span,p'))
+                .filter(isVisible)
+                .map(el => norm(el.innerText || el.textContent || ''))
+                .filter(Boolean)
+                .slice(0, 1000);
+              const txtAll = low(root.innerText || root.textContent || '');
+              const hasEmptyMarker =
+                /нет статистик|no stat|statistics not available|no data available|данные отсутств|no match statistics/.test(txtAll);
+              const hasAll = texts.some(t => /^(все|all)$/i.test(t));
+              const has1st = texts.some(t => /(1\\s*[-\\u2010-\\u2014]\\s*й(\\s*сет)?|1st(\\s*set)?|^\\s*1\\s*$)/i.test(t));
+              const has2nd = texts.some(t => /(2\\s*[-\\u2010-\\u2014]\\s*й(\\s*сет)?|2nd(\\s*set)?|^\\s*2\\s*$)/i.test(t));
+              const groups = Array.from(root.querySelectorAll('h1,h2,h3,h4,span,div,p'))
+                .filter(isVisible)
+                .map(el => norm(el.textContent || ''))
+                .filter(t => /^(Подача|Очки|Возврат|Игр|Разное|Service|Points|Return|Games|Miscellaneous)$/i.test(t))
+                .slice(0, 20);
+              const rowCount = root.querySelectorAll(
+                'div.d_flex.ai_center.jc_space-between, div.d_flex.jc_space-between, div.jc_space-between, div[class*="statisticsRow"], div[class*="statRow"]'
+              ).length;
+              const absentLikely = !!(hasEmptyMarker || ((!has1st || !has2nd) && groups.length === 0 && hasAll));
+              return {
+                absent_likely: absentLikely,
+                has_empty_marker: hasEmptyMarker,
+                has_all: hasAll,
+                has_1st: has1st,
+                has_2nd: has2nd,
+                groups: groups,
+                rowCount: rowCount,
+              };
+            }
+            """
+        )
+    except Exception:
+        return {}
 
 
 async def _wait_page_ready(page: Page, *, timeout_ms: int) -> None:
@@ -254,7 +369,7 @@ async def _wait_page_ready(page: Page, *, timeout_ms: int) -> None:
         pass
     # Small settle time to let async widgets mount.
     try:
-        await page.wait_for_timeout(450)
+        await page.wait_for_timeout(max(120, _DOM_READY_POLL_MS))
     except Exception:
         pass
 
@@ -448,6 +563,14 @@ async def _dismiss_overlays(page: Page) -> None:
 async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
     await _wait_page_ready(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms + 4_000)
     await _dismiss_overlays(page)
+    ov_state = await _consent_overlay_block_state(page)
+    if bool(ov_state.get("blocked")):
+        raise _dom_err(
+            step="open_statistics_tab",
+            code="consent_overlay_blocked",
+            message="Consent/captcha overlay still blocks interactions before opening statistics tab",
+            diag={"overlay": ov_state},
+        )
     if await _is_cloudflare_block(page):
         raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
     _dbg("click_statistics_tab")
@@ -461,6 +584,14 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
         except Exception:
             pass
     await _dismiss_overlays(page)
+    ov_state = await _consent_overlay_block_state(page)
+    if bool(ov_state.get("blocked")):
+        raise _dom_err(
+            step="open_statistics_tab",
+            code="consent_overlay_blocked",
+            message="Consent/captcha overlay still blocks interactions after dismiss",
+            diag={"overlay": ov_state},
+        )
 
     rx_ru = re.compile(r"^\\s*статистика\\s*$", re.I)
     rx_en = re.compile(r"^\\s*statistics\\s*$", re.I)
@@ -599,6 +730,14 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
             return
     except Exception:
         pass
+    ov_state = await _consent_overlay_block_state(page)
+    if bool(ov_state.get("blocked")):
+        raise _dom_err(
+            step="open_statistics_tab",
+            code="consent_overlay_blocked",
+            message="Consent/captcha overlay blocked statistics tab",
+            diag={"overlay": ov_state},
+        )
     raise DomStatsError("Не удалось открыть вкладку 'Статистика' (DOM)")
 
 
@@ -650,9 +789,17 @@ async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) ->
     patterns = rx_for(period_code)
     if not patterns:
         raise DomStatsError(f"step=period_select:{period_code}: unsupported period code")
+    if period_code in ("1ST", "2ND"):
+        avail = await _probe_stats_availability(page)
+        if isinstance(avail, dict) and bool(avail.get("absent_likely")):
+            raise _dom_err(
+                step=f"select_period_{period_code.lower()}",
+                code="stats_not_provided",
+                message=f"statistics absent likely: {avail}",
+            )
 
     async def _after_click() -> bool:
-        await page.wait_for_timeout(250 + max(0, _SLOW_LOAD_MS // 8))
+        await page.wait_for_timeout(max(90, _DOM_READY_POLL_MS // 2))
         selected = await _wait_period_selected(page, period_code=period_code, timeout_ms=min(4500, _UI_TIMEOUT_MS + 2000))
         ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
         if not ok:
@@ -979,7 +1126,7 @@ async def extract_statistics_dom(
     for attempt in range(step_retries + 1):
         try:
             await _click_statistics_tab(page, wait_stats_ms=wait_stats)
-            await page.wait_for_timeout(600 + max(0, _SLOW_LOAD_MS) + max(0, wait_stats // 2))
+            await page.wait_for_timeout(max(100, _DOM_READY_POLL_MS // 2))
             ok_rows = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats)
             if not ok_rows:
                 raise _dom_err(
@@ -1004,9 +1151,12 @@ async def extract_statistics_dom(
             await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
     if not stats_opened:
         msg = f"{type(open_err).__name__}: {open_err}" if open_err is not None else "statistics tab not reachable"
+        open_code = "statistics_tab_unreachable"
+        if isinstance(open_err, DomStatsError) and isinstance(open_err.code, str) and open_err.code.strip():
+            open_code = open_err.code.strip().lower()
         raise _dom_err(
             step="open_statistics_tab",
-            code="statistics_tab_unreachable",
+            code=open_code,
             message=msg,
             diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
         ) from open_err
@@ -1388,7 +1538,7 @@ async def extract_statistics_dom(
                     await page.wait_for_selector("div.d_flex.ai_center.jc_space-between", timeout=_UI_TIMEOUT_MS + _SLOW_LOAD_MS)
                 except Exception:
                     pass
-                await page.wait_for_timeout(350 + max(0, _SLOW_LOAD_MS // 6))
+                await page.wait_for_timeout(max(90, _DOM_READY_POLL_MS // 2))
                 groups_raw = await scrape_current_view()
                 if not isinstance(groups_raw, list):
                     raise _dom_err(
@@ -1413,6 +1563,15 @@ async def extract_statistics_dom(
                 await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
             except DomStatsError as ex:
                 select_err = ex
+                ex_code = str(getattr(ex, "code", "") or "")
+                if ex_code == "stats_not_provided" or "code=stats_not_provided" in str(ex):
+                    raise _dom_err(
+                        step=f"select_period_{per.lower()}",
+                        code="stats_not_provided",
+                        attempt=attempt + 1,
+                        message=str(ex),
+                        diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
+                    ) from ex
                 if attempt >= step_retries:
                     raise _dom_err(
                         step=f"select_period_{per.lower()}",
@@ -1485,7 +1644,8 @@ async def extract_statistics_dom(
             for it in items:
                 if not isinstance(it, dict):
                     continue
-                label = str(it.get("name") or "").strip()
+                # scrape_current_view returns "label"; keep "name" as legacy fallback.
+                label = str(it.get("label") or it.get("name") or "").strip()
                 if label:
                     seen_labels.setdefault(group_en, []).append(label)
                 mapped = map_item(group_en, label)
@@ -1544,12 +1704,22 @@ async def extract_statistics_dom(
             )
         except Exception:
             diag = None
+        code = "rows_not_ready"
+        try:
+            period_vals = list(diag.get("period") or []) if isinstance(diag, dict) else []
+            joined = " ".join(str(x or "") for x in period_vals).lower()
+            has_p1 = bool(re.search(r"(1\s*[-\u2010-\u2014]\s*й|1st|\b1\b)", joined))
+            has_p2 = bool(re.search(r"(2\s*[-\u2010-\u2014]\s*й|2nd|\b2\b)", joined))
+            if not (has_p1 and has_p2):
+                code = "stats_not_provided"
+        except Exception:
+            code = "rows_not_ready"
         msg = "No per-set statistics found in DOM (missing 1ST/2ND)"
         if isinstance(diag, dict):
             msg += f" | diag={diag}"
         raise _dom_err(
             step="wait_rows_2nd",
-            code="rows_not_ready",
+            code=code,
             message=msg,
             diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen, "diag": diag},
         )

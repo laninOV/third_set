@@ -95,27 +95,50 @@ class TelegramClient:
             return {"ok": False, "description": (desc or str(e))}
 
     def _api_get(self, method: str, payload: Dict[str, Any], timeout: int = 20) -> Dict:
-        try:
-            self._throttle("poll")
-            qs = _urlparse.urlencode({k: v for k, v in payload.items() if v is not None})
-            api_base = f"https://api.telegram.org/bot{self.token}/{method}?{qs}"
-            req = _urlrequest.Request(api_base, method="GET")
-            with _urlrequest.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            desc = None
-            if isinstance(e, HTTPError):
-                try:
-                    body = e.read().decode("utf-8", "ignore")
+        def _is_transient_poll_error(exc: Exception) -> bool:
+            msg = str(exc or "").lower()
+            return any(
+                token in msg
+                for token in (
+                    "timed out",
+                    "timeout",
+                    "connection reset",
+                    "reset by peer",
+                    "handshake operation timed out",
+                    "temporary failure",
+                    "nodename nor servname provided",
+                )
+            )
+
+        last_desc: Optional[str] = None
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                self._throttle("poll")
+                qs = _urlparse.urlencode({k: v for k, v in payload.items() if v is not None})
+                api_base = f"https://api.telegram.org/bot{self.token}/{method}?{qs}"
+                req = _urlrequest.Request(api_base, method="GET")
+                with _urlrequest.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                desc = None
+                if isinstance(e, HTTPError):
                     try:
-                        parsed = json.loads(body)
-                        if isinstance(parsed, dict):
-                            return parsed
+                        body = e.read().decode("utf-8", "ignore")
+                        try:
+                            parsed = json.loads(body)
+                            if isinstance(parsed, dict):
+                                return parsed
+                        except Exception:
+                            desc = body
                     except Exception:
-                        desc = body
-                except Exception:
-                    pass
-            return {"ok": False, "description": (desc or str(e))}
+                        pass
+                last_desc = desc or str(e)
+                if attempt < (max_attempts - 1) and _is_transient_poll_error(e):
+                    time.sleep(min(1.0, 0.25 * (attempt + 1)))
+                    continue
+                break
+        return {"ok": False, "description": (last_desc or "telegram getUpdates failed")}
 
     def send_text(self, text: str, *, parse_mode: str = "HTML") -> Optional[int]:
         r = self.send_text_result(text, parse_mode=parse_mode)
