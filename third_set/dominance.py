@@ -51,6 +51,7 @@ def _safe_div(n: float, d: float) -> Optional[float]:
     return n / d
 
 
+# legacy API (kept for compatibility)
 def compute_live_metrics(points: DominanceLivePoints) -> Tuple[Optional[float], int, Optional[float]]:
     n_points = points.n_points
     tpw_home = _safe_div(float(points.tp_home), float(n_points))
@@ -208,4 +209,3 @@ def make_verdict(
         profile_home=profile_home,
         profile_away=profile_away,
     )
-

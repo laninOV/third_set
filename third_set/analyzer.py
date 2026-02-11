@@ -162,20 +162,6 @@ def _index_pack(*, home: Optional[float], away: Optional[float]) -> Dict[str, An
     return {"home": home, "away": away, "diff": diff}
 
 
-def _ewma(values: List[float], *, alpha: float) -> Optional[float]:
-    if not values:
-        return None
-    a = float(alpha)
-    if a <= 0.0:
-        return float(values[0])
-    if a >= 1.0:
-        return float(values[-1])
-    m = float(values[0])
-    for v in values[1:]:
-        m = a * float(v) + (1.0 - a) * m
-    return m
-
-
 def _stability_from_sd(sd: Optional[float], *, scale: float) -> Optional[float]:
     if sd is None:
         return None
@@ -1161,19 +1147,6 @@ def _points_1st2nd_from_stats(stats_json: Dict[str, Any]) -> Optional[DominanceL
     return DominanceLivePoints(spw_home=spw_home, rpw_home=rpw_home, spw_away=spw_away, rpw_away=rpw_away)
 
 
-async def _history_rows_for_player(
-    page: Page,
-    *,
-    team_id: int,
-    max_history: int,
-    surface_filter: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    rows, _audit = await _history_rows_for_player_audit(
-        page, team_id=team_id, max_history=max_history, surface_filter=surface_filter
-    )
-    return rows
-
-
 async def _history_rows_for_player_audit(
     page: Page,
     *,
@@ -1239,7 +1212,19 @@ async def _history_rows_for_player_audit(
         ms = int(float(total_s) * 1000.0 * 0.6)
         return max(8_000, min(20_000, ms))
 
-    wait_stats_ms = 6000 if slow_mode else None
+    try:
+        wait_stats_base_ms = int(
+            os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS") or ("1800" if slow_mode else "0")
+        )
+    except Exception:
+        wait_stats_base_ms = 1800 if slow_mode else 0
+    try:
+        wait_stats_fallback_ms = int(os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS_FALLBACK") or "3500")
+    except Exception:
+        wait_stats_fallback_ms = 3500
+    wait_stats_base_ms = max(0, min(20_000, wait_stats_base_ms))
+    wait_stats_fallback_ms = max(wait_stats_base_ms, min(25_000, wait_stats_fallback_ms))
+    wait_stats_ms: Optional[int] = wait_stats_base_ms if slow_mode else None
 
     raw_player_budget = os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S")
     raw_player_budget_hist = os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S_HISTORY_ONLY")
@@ -1322,6 +1307,7 @@ async def _history_rows_for_player_audit(
     candidate_discovery_ms = 0.0
     events: List[Dict[str, Any]] = []
     seen_event_ids: set[int] = set()
+    seen_candidate_keys: set[str] = set()
     links: List[str] = []
     excluded_by_reason: Dict[str, int] = {}
     if no_limits_enabled and slow_mode:
@@ -1370,26 +1356,69 @@ async def _history_rows_for_player_audit(
         events.append(ev)
         return True
 
-    async def _resolve_event_from_link(link_s: str) -> Optional[Dict[str, Any]]:
+    def _accept_candidate_link(link_s: str, *, source: str) -> bool:
+        if not isinstance(link_s, str) or not link_s:
+            return False
+        eid = parse_event_id_from_match_link(link_s)
+        key = f"id:{eid}" if isinstance(eid, int) else f"link:{link_s.split('#', 1)[0]}"
+        if key in seen_candidate_keys:
+            return False
+        seen_candidate_keys.add(key)
+        if isinstance(eid, int):
+            seen_event_ids.add(eid)
+        events.append(
+            {
+                "id": int(eid) if isinstance(eid, int) else None,
+                "_candidate_link": link_s,
+                "_candidate_key": key,
+                "_candidate_source": source,
+            }
+        )
+        return True
+
+    async def _resolve_event_from_link(link_s: str, *, resolve_page: Optional[Page] = None) -> Optional[Dict[str, Any]]:
         if not isinstance(link_s, str) or not link_s:
             return None
+        p = resolve_page or page
         eid = parse_event_id_from_match_link(link_s)
         nav_payload_t = 120.0 if (no_limits_enabled and slow_mode) else (6.0 if (slow_mode and failfast_enabled) else 12.0)
         if isinstance(eid, int):
             if no_limits_enabled and slow_mode:
-                payload = await get_event_via_navigation(page, int(eid), timeout_ms=120_000)
+                payload = await get_event_via_navigation(p, int(eid), timeout_ms=120_000)
             else:
                 payload = await asyncio.wait_for(
-                    get_event_via_navigation(page, int(eid), timeout_ms=int(nav_payload_t * 1000.0)),
+                    get_event_via_navigation(p, int(eid), timeout_ms=int(nav_payload_t * 1000.0)),
                     timeout=nav_payload_t,
                 )
         else:
             if no_limits_enabled and slow_mode:
-                payload = await get_event_from_match_url_auto(page, link_s, timeout_ms=120_000)
+                payload = await get_event_from_match_url_auto(p, link_s, timeout_ms=120_000)
             else:
-                payload = await asyncio.wait_for(get_event_from_match_url_auto(page, link_s), timeout=nav_payload_t)
+                payload = await asyncio.wait_for(get_event_from_match_url_auto(p, link_s), timeout=nav_payload_t)
         ev = payload.get("event") if isinstance(payload, dict) else None
         return ev if isinstance(ev, dict) else None
+
+    def _event_needs_resolution(ev: Dict[str, Any]) -> bool:
+        """
+        Link candidates in slow mode are intentionally lightweight.
+        Resolve them lazily only when the event is actually scanned.
+        """
+        if not isinstance(ev, dict):
+            return True
+        if ev.get("_candidate_link"):
+            return True
+        if not isinstance(ev.get("id"), int):
+            return True
+        status = ev.get("status")
+        if not isinstance(status, dict) or not status:
+            return True
+        if not isinstance(ev.get("homeTeam"), dict) or not isinstance(ev.get("awayTeam"), dict):
+            return True
+        if not isinstance(ev.get("homeScore"), dict) or not isinstance(ev.get("awayScore"), dict):
+            return True
+        return False
+
+    resolved_event_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
     # 1) Try the player profile URL derived from the match page DOM (most reliable; avoids 404).
     if match_url and match_event_id and match_side in ("home", "away"):
         try:
@@ -1451,10 +1480,13 @@ async def _history_rows_for_player_audit(
             if len(events) >= candidate_target:
                 break
             try:
-                ev = await _resolve_event_from_link(str(link))
-                if ev is None:
-                    continue
-                _accept_candidate_event(ev)
+                if slow_mode:
+                    _accept_candidate_link(str(link), source="profile_links")
+                else:
+                    ev = await _resolve_event_from_link(str(link))
+                    if ev is None:
+                        continue
+                    _accept_candidate_event(ev)
             except Exception:
                 continue
     # 3) Augment with API team-last history if DOM links are too shallow.
@@ -1563,15 +1595,41 @@ async def _history_rows_for_player_audit(
         # If we didn't create extra pages (workers=1), use the main page.
         if hist_page is None:
             hist_page = page
-        eid = ev.get("id")
+        cur_ev = ev
+        if _event_needs_resolution(cur_ev):
+            link_s = str(cur_ev.get("_candidate_link") or "").strip()
+            raw_eid = cur_ev.get("id")
+            cache_key = str(cur_ev.get("_candidate_key") or (f"id:{raw_eid}" if isinstance(raw_eid, int) else f"link:{link_s}"))
+            cached = resolved_event_by_key.get(cache_key)
+            if cached is None and cache_key not in resolved_event_by_key:
+                try:
+                    if link_s:
+                        cached = await _resolve_event_from_link(link_s, resolve_page=hist_page)
+                    elif isinstance(raw_eid, int):
+                        base = _sofascore_base_from_url(hist_page.url or SOFASCORE_TENNIS_URL)
+                        fallback_link = f"{base}/event/{int(raw_eid)}#id:{int(raw_eid)}"
+                        cached = await _resolve_event_from_link(fallback_link, resolve_page=hist_page)
+                except Exception:
+                    cached = None
+                resolved_event_by_key[cache_key] = cached
+            elif cache_key in resolved_event_by_key:
+                cached = resolved_event_by_key.get(cache_key)
+            if isinstance(cached, dict):
+                merged = dict(cached)
+                for k in ("_candidate_link", "_candidate_key", "_candidate_source"):
+                    if k in cur_ev and k not in merged:
+                        merged[k] = cur_ev.get(k)
+                cur_ev = merged
+
+        eid = cur_ev.get("id")
         if not eid:
             return idx, None, "missing_event_id", {}
-        summary = summarize_event_for_team(ev, team_id=team_id)
+        summary = summarize_event_for_team(cur_ev, team_id=team_id)
         if summary.get("won") is None:
             return idx, None, "winner_unknown", summary
         # Determine if match is BO3 decider via score fields.
-        hs = ev.get("homeScore") or {}
-        aw = ev.get("awayScore") or {}
+        hs = cur_ev.get("homeScore") or {}
+        aw = cur_ev.get("awayScore") or {}
         has_set3 = hs.get("period3") is not None and aw.get("period3") is not None
         if slow_mode or os.getenv("THIRDSET_HISTORY_SKIP_SET3") in ("1", "true", "yes"):
             has_set3 = False
@@ -1594,7 +1652,7 @@ async def _history_rows_for_player_audit(
         if s3h is not None and s3a is not None:
             won_set3 = (s3h > s3a) if is_home else (s3a > s3h)
 
-        surface = normalize_surface(ev.get("groundType"))
+        surface = normalize_surface(cur_ev.get("groundType"))
         if sf and surface != sf:
             return idx, None, "surface_mismatch", summary
 
@@ -1609,8 +1667,8 @@ async def _history_rows_for_player_audit(
         if hist_page is not None:
             dom_attempted = True
             try:
-                slug = ev.get("slug")
-                custom = ev.get("customId")
+                slug = cur_ev.get("slug")
+                custom = cur_ev.get("customId")
                 base = _sofascore_base_from_url(hist_page.url or SOFASCORE_TENNIS_URL)
                 if slug and custom:
                     url = f"{base}/tennis/match/{slug}/{custom}"
@@ -1936,35 +1994,6 @@ async def _history_rows_for_player_audit(
         "navigation_failed",
         "period_select_failed",
     }
-    absent_signal_codes = {
-        "rows_not_ready",
-        "stats_not_provided",
-        "stats_panel_absent",
-        "stats_rows_absent",
-    }
-
-    def _transient_signal_hits() -> int:
-        try:
-            exr = dict(excluded_by_reason or {})
-            return int(sum(int(exr.get(f"code_{c}", 0) or 0) for c in transient_signal_codes))
-        except Exception:
-            return 0
-
-    def _hard_absent_signal_hits() -> int:
-        try:
-            exr = dict(excluded_by_reason or {})
-            hits = 0
-            hits += int(exr.get("rows_not_ready_repeated", 0) or 0)
-            hits += int(exr.get("stats_not_provided_storm", 0) or 0)
-            hits += int(exr.get("no_finished_singles", 0) or 0)
-            if int(exr.get("profile_links_empty", 0) or 0) > 0 and int(len(events)) <= 0:
-                hits += 1
-            for c in absent_signal_codes:
-                hits += int(exr.get(f"code_{c}", 0) or 0)
-            return int(hits)
-        except Exception:
-            return 0
-
     # Prime initial tasks
     for _ in range(workers):
         if not await _launch_next():
@@ -2005,6 +2034,7 @@ async def _history_rows_for_player_audit(
                 excluded_by_reason["wait_no_result"] = excluded_by_reason.get("wait_no_result", 0) + 1
             break
         for t in done:
+            stop_side_now = False
             idx, row, reason, summary = t.result()
             scanned += 1
             if isinstance(summary, dict) and summary.get("_dom_attempted"):
@@ -2024,6 +2054,20 @@ async def _history_rows_for_player_audit(
                         excluded_by_reason[f"code_{code}"] = excluded_by_reason.get(f"code_{code}", 0) + 1
                     if len(valid_rows) == 0 and code in transient_signal_codes:
                         transient_start_failures += 1
+                    if (
+                        slow_mode
+                        and isinstance(wait_stats_ms, int)
+                        and wait_stats_ms < wait_stats_fallback_ms
+                        and len(valid_rows) == 0
+                        and scanned <= 3
+                        and code in ("rows_not_ready", "period_select_failed")
+                    ):
+                        prev_wait = wait_stats_ms
+                        wait_stats_ms = wait_stats_fallback_ms
+                        _log_step(
+                            f"History[{progress_label or match_side}]: wait_stats_raise "
+                            f"reason={code} old={prev_wait} new={wait_stats_ms}"
+                        )
                     if code == "rows_not_ready":
                         rows_not_ready_hits_total += 1
                         rows_not_ready_hits_consecutive += 1
@@ -2075,6 +2119,21 @@ async def _history_rows_for_player_audit(
                             "dom_error": (summary or {}).get("dom_error") if isinstance(summary, dict) else None,
                         }
                     )
+                # Strict history rule requested by user:
+                # if one of required 5 matches has no stats, stop this side immediately.
+                if slow_mode and len(valid_rows) < max_history and reason == "dom_stats_error":
+                    excluded_by_reason["missing_stats_in_required_five"] = (
+                        excluded_by_reason.get("missing_stats_in_required_five", 0) + 1
+                    )
+                    failfast_trigger = failfast_trigger or "missing_stats_in_required_five"
+                    _log_step(
+                        f"History[{progress_label or match_side}]: failfast missing stats "
+                        f"valid={len(valid_rows)}/{max_history} scanned={scanned}"
+                    )
+                    for tx in tasks:
+                        tx.cancel()
+                    tasks.clear()
+                    stop_side_now = True
             elif row is None:
                 consecutive_dom_timeouts = 0
                 consecutive_step_failures = 0
@@ -2106,6 +2165,8 @@ async def _history_rows_for_player_audit(
                         )
                     except Exception:
                         pass
+            if stop_side_now:
+                break
             # Hard fail-fast on repeated UI-unavailable states (statistics tab unreachable / consent blocked).
             if ui_unavailable_hits >= tab_unreachable_failfast_hits:
                 excluded_by_reason["ui_unavailable_storm"] = excluded_by_reason.get("ui_unavailable_storm", 0) + 1
@@ -2175,6 +2236,8 @@ async def _history_rows_for_player_audit(
             # Launch next task only after fail-fast checks above.
             if len(valid_rows) < max_history:
                 await _launch_next()
+        if str(failfast_trigger or "").strip().lower() == "missing_stats_in_required_five":
+            break
 
         if len(valid_rows) >= max_history:
             # Cancel any remaining tasks; we have enough.
@@ -2184,7 +2247,11 @@ async def _history_rows_for_player_audit(
             break
 
     # Second pass for DOM timeouts: retry problematic events in a fresh page context.
-    if 0 < len(valid_rows) < max_history and total_dom_timeouts <= 0:
+    if (
+        0 < len(valid_rows) < max_history
+        and total_dom_timeouts <= 0
+        and str(failfast_trigger or "").strip().lower() != "missing_stats_in_required_five"
+    ):
         retry_candidates: List[int] = []
         if isinstance(excluded_events, list):
             for ex in excluded_events:
@@ -2370,9 +2437,6 @@ def build_surface_calibration(
     surface_norm = normalize_surface(surface)
     same = [r for r in rows if r.get("surface") == surface_norm]
     use = same if len(same) >= min_rows else rows
-
-    def collect(key: str):
-        return [r.get(key) for r in use]
 
     return {
         "ssw_12": summarize([v for r in use for v in (r.get("ssw_1"), r.get("ssw_2"))]),
@@ -2600,10 +2664,12 @@ async def analyze_once(
     def _home_unavailable_for_fair_compare(rows: List[Dict[str, Any]], audit: HistoryAudit) -> bool:
         # If one side has no valid rows and hit a strong failure signal,
         # skip the opposite side scan: comparison would be biased anyway.
+        ff = str(getattr(audit, "failfast_trigger", "") or "").strip().lower()
+        if ff == "missing_stats_in_required_five":
+            return True
         if len(rows) > 0:
             return False
         exr = dict(getattr(audit, "excluded_by_reason", {}) or {})
-        ff = str(getattr(audit, "failfast_trigger", "") or "").strip().lower()
         if ff in (
             "statistics_tab_unreachable_repeated",
             "rows_not_ready_repeated",

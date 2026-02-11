@@ -145,6 +145,7 @@ async def _dismiss_overlays_basic(page: Page) -> None:
             pass
 
 
+# legacy API (kept for compatibility)
 async def warm_player_page(page: Page, *, team_id: int, team_slug: str) -> None:
     """
     Open player's page to establish Sofascore cookies/consent in this tab.
@@ -1784,6 +1785,7 @@ async def get_event_from_match_url_auto(page: Page, match_url: str, *, timeout_m
         page.remove_listener("response", _on_response)
 
 
+# legacy API (kept for compatibility)
 def live_event_from_event_payload(payload: Dict[str, Any]) -> LiveEvent:
     e = payload.get("event") or {}
     home = e.get("homeTeam") or {}

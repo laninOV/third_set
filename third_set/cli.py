@@ -66,6 +66,7 @@ def _runtime_build_stamp() -> str:
 
 
 _BUILD_STAMP = _runtime_build_stamp()
+_TG_RESTART_RC = 85
 
 
 def _print_audit(snapshot: MatchSnapshot) -> None:
@@ -204,9 +205,6 @@ def _format_tg_message(
 
     def _pct01(x: Any) -> Optional[int]:
         return int(round(float(x) * 100.0)) if isinstance(x, (int, float)) else None
-
-    def _s100(v: Any) -> str:
-        return str(int(round(float(v) * 100.0))) if isinstance(v, (int, float)) else "—"
 
     def _line_kv(k: str, v: str) -> str:
         return f"<b>{_html_escape(k)}</b>: {_html_escape(v)}"
@@ -381,13 +379,6 @@ def _format_tg_message(
             it = sigs.get(key)
             return it.get(side) if isinstance(it, dict) else None
 
-        def _i100(key: str, side: str) -> str:
-            it = idx.get(key)
-            if not isinstance(it, dict):
-                return "—"
-            v = it.get(side)
-            return str(int(round(float(v) * 100.0))) if isinstance(v, (int, float)) else "—"
-
         def _tpw_rating(side: str, window: str) -> str:
             s = (tpw_scores.get(side) or {}) if isinstance(tpw_scores.get(side), dict) else {}
             key = "last3" if window == "3" else "last5"
@@ -405,82 +396,6 @@ def _format_tg_message(
                 return None
             n = it.get("n")
             return int(n) if isinstance(n, int) else None
-
-        def _tpw_trend(side: str) -> str:
-            try:
-                r3s = _tpw_rating(side, "3")
-                r5s = _tpw_rating(side, "5")
-                if not (r3s.isdigit() and r5s.isdigit()):
-                    return "—"
-                r3 = int(r3s)
-                r5 = int(r5s)
-                return f"{r3 - r5:+d}"
-            except Exception:
-                return "—"
-
-        def _mods_line(name: str) -> str:
-            # Per-module compact comparison (no walls of numbers).
-            # Uses current metrics if available; otherwise history means.
-            by_name = {m.name: m for m in (mods or []) if hasattr(m, "name")}
-            m = by_name.get(name)
-            if not m:
-                return ""
-            side_ru = {"home": "1", "away": "2", "neutral": "нейтр"}.get(m.side, "нейтр")
-            strength = int(m.strength or 0)
-            # Pull a couple of headline numbers.
-            if name == "M1_dominance":
-                pts = (cur.get("points") or {}) if isinstance(cur.get("points"), dict) else {}
-                tpw = pts.get("tpw_home")
-                dr = pts.get("dr")
-                if isinstance(tpw, (int, float)) and isinstance(dr, (int, float)):
-                    return f"M1 Доминирование: {side_ru} (сила {strength}) | доля очков={tpw*100:.1f}%  DR={dr:.3f}"
-                # history fallback in analyzer prints rating5; reflect that too
-                r5h = _tpw_rating("home", "5")
-                r5a = _tpw_rating("away", "5")
-                return f"M1 Доминирование (ист): {side_ru} (сила {strength}) | rating5={r5h}/{r5a}"
-            if name == "M2_second_serve":
-                s = (cur.get("serve") or {}) if isinstance(cur.get("serve"), dict) else {}
-                ssw = (s.get("ssw") or {}) if isinstance(s.get("ssw"), dict) else {}
-                dfr = ((s.get("df") or {}).get("dfr") or {}) if isinstance((s.get("df") or {}).get("dfr"), dict) else {}
-                if isinstance(ssw.get("home"), (int, float)) and isinstance(ssw.get("away"), (int, float)):
-                    return f"M2 Подача: {side_ru} (сила {strength}) | 2-я подача={ssw.get('home')*100:.0f}%/{ssw.get('away')*100:.0f}%  двойные={dfr.get('home',0)*100:.1f}%/{dfr.get('away',0)*100:.1f}%"
-                return (
-                    f"M2 Подача (ист): {side_ru} (сила {strength}) | "
-                    f"SSW12={_hist_metric('home','ssw_12')}/{_hist_metric('away','ssw_12')} "
-                    f"BPSR12={_hist_metric('home','bpsr_12')}/{_hist_metric('away','bpsr_12')}"
-                )
-            if name == "M3_return_pressure":
-                r = (cur.get("return") or {}) if isinstance(cur.get("return"), dict) else {}
-                rpr = (r.get("rpr") or {}) if isinstance(r.get("rpr"), dict) else {}
-                bpconv = (r.get("bpconv") or {}) if isinstance(r.get("bpconv"), dict) else {}
-                if isinstance(rpr.get("home"), (int, float)) and isinstance(rpr.get("away"), (int, float)):
-                    return f"M3 Давление на приёме: {side_ru} (сила {strength}) | очки на приёме={rpr.get('home')*100:.0f}%/{rpr.get('away')*100:.0f}%  конверсия БП={bpconv.get('home',0)*100:.0f}%/{bpconv.get('away',0)*100:.0f}%"
-                return (
-                    f"M3 Давление на приёме (ист): {side_ru} (сила {strength}) | "
-                    f"RPR12={_hist_metric('home','rpr_12')}/{_hist_metric('away','rpr_12')} "
-                    f"BPconv12={_hist_metric('home','bpconv_12')}/{_hist_metric('away','bpconv_12')}"
-                )
-            if name == "M4_clutch":
-                s = (cur.get("serve") or {}) if isinstance(cur.get("serve"), dict) else {}
-                bps = (s.get("bps") or {}) if isinstance(s.get("bps"), dict) else {}
-                bpsr_h = (bps.get("home") or {}).get("rate") if isinstance(bps.get("home"), dict) else None
-                bpsr_a = (bps.get("away") or {}).get("rate") if isinstance(bps.get("away"), dict) else None
-                r = (cur.get("return") or {}) if isinstance(cur.get("return"), dict) else {}
-                bpconv = (r.get("bpconv") or {}) if isinstance(r.get("bpconv"), dict) else {}
-                if isinstance(bpsr_h, (int, float)) and isinstance(bpsr_a, (int, float)):
-                    return (
-                        f"M4 Клатч: {side_ru} (сила {strength}) | "
-                        f"спасение БП={bpsr_h*100:.0f}%/{bpsr_a*100:.0f}%  "
-                        f"конверсия БП={bpconv.get('home',0)*100:.0f}%/{bpconv.get('away',0)*100:.0f}%"
-                    )
-                return (
-                    f"M4 Клатч (ист): {side_ru} (сила {strength}) | "
-                    f"BPSR12={_hist_metric('home','bpsr_12')}/{_hist_metric('away','bpsr_12')} "
-                    f"BPconv12={_hist_metric('home','bpconv_12')}/{_hist_metric('away','bpconv_12')}"
-                )
-            if name == "M5_form_profile":
-                return f"M5 Форма/сеты: {side_ru} (сила {strength}) | {_hist_sets('home')} vs {_hist_sets('away')}"
-            return f"{name}: {side_ru} (сила {strength})"
 
         def _hist_metric(side: str, key: str) -> str:
             src = cal.get(side) if isinstance(cal, dict) else None
@@ -1302,19 +1217,6 @@ def _print_brief(ctx, meta: dict) -> None:
             calh = (cal.get("home") or {}) if isinstance(cal, dict) else {}
             cala = (cal.get("away") or {}) if isinstance(cal, dict) else {}
 
-            def _hist_mean(side: str, key: str) -> Optional[float]:
-                src = calh if side == "home" else cala
-                if not isinstance(src, dict):
-                    return None
-                ms = src.get(key)
-                if not isinstance(ms, dict):
-                    return None
-                m = ms.get("mean")
-                n = ms.get("n")
-                if not isinstance(m, (int, float)) or not isinstance(n, int) or n <= 0:
-                    return None
-                return float(m)
-
             def _hist_pct(side: str, key: str) -> str:
                 src = calh if side == "home" else cala
                 if not isinstance(src, dict):
@@ -1330,9 +1232,6 @@ def _print_brief(ctx, meta: dict) -> None:
 
             def _pct(x):
                 return "—" if not isinstance(x, (int, float)) else f"{float(x)*100:.1f}%"
-
-            def _pct_pp(x):
-                return "—" if not isinstance(x, (int, float)) else f"{float(x):+.1f}пп"
 
             def _line(name: str, side: str, strength: int, details: str) -> str:
                 winner = "нейтр" if side == "neutral" or strength <= 0 else ("1" if side == "home" else "2")
@@ -2091,36 +1990,6 @@ def _is_set_score_1_1_after_two_sets(event_payload: dict) -> bool:
     )
 
 
-def _is_pre_decider_break(event_payload: dict) -> bool:
-    """
-    True when match is BO3 singles and just reached 1:1 after two sets,
-    but 3rd set hasn't started yet (period3 games are 0/None).
-
-    In this window, ALL-stats == 1ST+2ND, so we can safely snapshot ALL via DOM.
-    """
-    e = event_payload.get("event") or {}
-    status = e.get("status") or {}
-    if (status.get("type") or "").lower() != "inprogress":
-        return False
-    home = e.get("homeScore") or {}
-    away = e.get("awayScore") or {}
-    if home.get("current") != 1 or away.get("current") != 1:
-        return False
-    # If point scoring already started in set3, ALL may include 3rd-set points (mixed).
-    # Only consider it a safe between-sets window when current point score is missing/zero-ish.
-    hpt = home.get("point")
-    apt = away.get("point")
-    if isinstance(hpt, str) and hpt.strip() not in ("", "0", "0:0"):
-        return False
-    if isinstance(apt, str) and apt.strip() not in ("", "0", "0:0"):
-        return False
-    s3h = home.get("period3")
-    s3a = away.get("period3")
-    if (s3h is None or s3h == 0) and (s3a is None or s3a == 0):
-        return True
-    return False
-
-
 async def _print_team_histories(page, *, event_payload: dict, history: int) -> None:
     e = event_payload.get("event") or {}
     home = e.get("homeTeam") or {}
@@ -2829,7 +2698,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             ["Список live", "Анализ всех live"],
             ["Список upcoming", "Анализ upcoming"],
             ["Анализ по ID", "Стоп текущий"],
-            ["Выключить бота"],
+            ["Перезапуск", "Выключить бота"],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -2870,6 +2739,11 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "1200")
     except Exception:
         analyze_timeout_hist_s = 1200
+    try:
+        poll_timeout_s = int(os.getenv("THIRDSET_TG_POLL_TIMEOUT_S") or "8")
+    except Exception:
+        poll_timeout_s = 8
+    poll_timeout_s = max(1, min(50, poll_timeout_s))
     no_limits_mode = os.getenv("THIRDSET_NO_LIMITS", "0").strip().lower() not in ("0", "false", "no")
 
     async def send(text: str) -> None:
@@ -3680,7 +3554,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         last_poll_log_ts = time.time()
         while True:
             try:
-                upd = await asyncio.to_thread(client.get_updates, offset=offset, limit=20, timeout=20)
+                upd = await asyncio.to_thread(client.get_updates, offset=offset, limit=20, timeout=poll_timeout_s)
                 if not (isinstance(upd, dict) and upd.get("ok")):
                     poll_err_streak += 1
                     desc = ""
@@ -3828,6 +3702,20 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             active_task["task"] = None
                             await send("Остановил текущую задачу.")
                             continue
+                        if _cmd_eq_or_prefix(text_cmd, ("перезапуск", "перезапустить", "/restart")):
+                            _log_route(text, text_cmd, "restart")
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: restart", flush=True)
+                            stop_flag["stop"] = True
+                            t = active_task.get("task")
+                            if t and not t.done():
+                                try:
+                                    t.cancel()
+                                except Exception:
+                                    pass
+                            active_task["task"] = None
+                            await send("Перезапускаю бота…")
+                            return _TG_RESTART_RC
                         if _cmd_eq_or_prefix(text_cmd, ("выключить бота", "/shutdown")):
                             _log_route(text, text_cmd, "shutdown_prompt")
                             if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
@@ -3903,9 +3791,14 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                             continue
                         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                             print(f"[TG] unhandled text: {text!r}", flush=True)
+                        await send("Не понял команду. Используй кнопки меню или /start.")
                     except Exception as ex:
                         if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
                             print(f"[TG] handler error: {ex}", flush=True)
+                        try:
+                            await send("Ошибка обработки команды. Повтори ещё раз.")
+                        except Exception:
+                            pass
                         continue
                 await asyncio.sleep(0.1)
             except Exception as ex:
@@ -4434,14 +4327,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "tg-updates":
         return asyncio.run(cmd_tg_updates(tg_token=args.tg_token, tg_chat=args.tg_chat, limit=args.limit))
     if args.cmd == "tg-bot":
-        return asyncio.run(
-            cmd_tg_bot(
-                max_history=args.max_history,
-                headless=headless,
-                profile_dir=profile_dir,
-                history_only=args.history_only,
+        while True:
+            rc = asyncio.run(
+                cmd_tg_bot(
+                    max_history=args.max_history,
+                    headless=headless,
+                    profile_dir=profile_dir,
+                    history_only=args.history_only,
+                )
             )
-        )
+            if rc != _TG_RESTART_RC:
+                return rc
+            print("TG bot: restarting…", flush=True)
+            try:
+                time.sleep(0.3)
+            except Exception:
+                pass
     if args.cmd == "probe-stats":
         return asyncio.run(cmd_probe_stats(limit=args.limit, headless=headless, profile_dir=profile_dir))
     if args.cmd == "probe-dom":

@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from playwright.async_api import Page
 
-from third_set.browser_utils import clear_browser_cache, disable_network_cache, page_is_usable
+from third_set.browser_utils import disable_network_cache
 
 
 class DomStatsError(RuntimeError):
@@ -354,17 +354,18 @@ async def _wait_page_ready(page: Page, *, timeout_ms: int) -> None:
     Wait for page hydration before interacting with tabs/stats.
     Sofascore often finishes DOMContentLoaded early while tab controls are still mounting.
     """
-    t = max(1500, int(timeout_ms))
+    t = max(1200, int(timeout_ms))
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=min(t, 8_000))
+        await page.wait_for_load_state("domcontentloaded", timeout=min(t, 3_500))
     except Exception:
         pass
     try:
-        await page.wait_for_function("() => document.readyState === 'complete'", timeout=min(t, 10_000))
+        await page.wait_for_function("() => document.readyState === 'complete'", timeout=min(t, 2_500))
     except Exception:
         pass
+    # Sofascore often keeps background requests open; keep this short best-effort.
     try:
-        await page.wait_for_load_state("networkidle", timeout=min(t, 8_000))
+        await page.wait_for_load_state("networkidle", timeout=min(t, 1_200))
     except Exception:
         pass
     # Small settle time to let async widgets mount.
@@ -561,6 +562,7 @@ async def _dismiss_overlays(page: Page) -> None:
 
 
 async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
+    settle_ms = max(80, _DOM_READY_POLL_MS)
     await _wait_page_ready(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms + 4_000)
     await _dismiss_overlays(page)
     ov_state = await _consent_overlay_block_state(page)
@@ -574,15 +576,26 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
     if await _is_cloudflare_block(page):
         raise DomStatsError("Cloudflare блокирует страницу (нужно реальное окно/куки)")
     _dbg("click_statistics_tab")
-    # Sofascore renders match sub-tabs asynchronously; wait a bit for the UI to hydrate.
+    # Sofascore renders match sub-tabs asynchronously.
+    # Avoid sequential RU->EN waits (can cost ~12s on each /en-us page).
     try:
-        # IMPORTANT: match exact tab label, not any substring like "...геймы, сеты, статистика".
-        await page.wait_for_selector('text="Статистика"', timeout=12_000)
+        await page.wait_for_function(
+            """
+            () => {
+              const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = new Set(['статистика', 'statistics']);
+              const els = document.querySelectorAll('a,button,[role="tab"],[role="button"],[role="link"],div,span');
+              for (const el of els) {
+                if (want.has(norm(el.innerText || el.textContent || ''))) return true;
+              }
+              return false;
+            }
+            """,
+            timeout=6_000,
+            polling=max(80, _DOM_READY_POLL_MS),
+        )
     except Exception:
-        try:
-            await page.wait_for_selector('text="Statistics"', timeout=12_000)
-        except Exception:
-            pass
+        pass
     await _dismiss_overlays(page)
     ov_state = await _consent_overlay_block_state(page)
     if bool(ov_state.get("blocked")):
@@ -606,7 +619,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                     tab = tl.get_by_role("tab", name=rx)
                     if await tab.count():
                         await tab.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                        await page.wait_for_timeout(500)
+                        await page.wait_for_timeout(settle_ms)
                         ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                         if not ok:
                             raise DomStatsError("step=statistics_tab: stats rows not ready after tab click")
@@ -632,7 +645,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                     if not (await loc.count()):
                         continue
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(settle_ms)
                     ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                     if not ok:
                         raise DomStatsError("step=statistics_tab: stats rows not ready after role click")
@@ -644,7 +657,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                 loc = root.locator("a,button,[role='tab'],[role='button'],[role='link']").filter(has_text=name_rx)
                 if await loc.count():
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(settle_ms)
                     ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                     if not ok:
                         raise DomStatsError("step=statistics_tab: stats rows not ready after css click")
@@ -671,7 +684,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
             """
         )
         if clicked:
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(settle_ms)
             # Give the stats block time to hydrate.
             ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
             if not ok:
@@ -692,7 +705,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
             }"""
         )
         if clicked:
-            await page.wait_for_timeout(700)
+            await page.wait_for_timeout(max(100, int(settle_ms * 1.5)))
             if await page.locator("#tabpanel-statistics").count():
                 ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                 if not ok:
@@ -718,7 +731,7 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
               } catch (e) {}
             }"""
         )
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(max(120, int(settle_ms * 1.5)))
         await _dismiss_overlays(page)
         tabpanel = page.locator("#tabpanel-statistics")
         # Do not require "visible": consent overlays can affect visibility checks.
@@ -1191,10 +1204,10 @@ async def extract_statistics_dom(
         try:
             for _ in range(3):
                 await page.mouse.wheel(0, 1600)
-                await page.wait_for_timeout(350)
+                await page.wait_for_timeout(max(120, int(_DOM_READY_POLL_MS * 1.2)))
             # Small scroll back up keeps header sections in view for stable DOM.
             await page.mouse.wheel(0, -2400)
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
         except Exception:
             pass
 
@@ -1206,7 +1219,7 @@ async def extract_statistics_dom(
                 h = page.get_by_text(lab, exact=True)
                 if await h.count():
                     await h.first.scroll_into_view_if_needed(timeout=1500)
-                    await page.wait_for_timeout(200)
+                    await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
                     break
         except Exception:
             pass
@@ -1214,7 +1227,7 @@ async def extract_statistics_dom(
         try:
             for _ in range(2):
                 await page.mouse.wheel(0, -1200)
-                await page.wait_for_timeout(180)
+                await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
         except Exception:
             pass
 

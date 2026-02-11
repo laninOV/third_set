@@ -140,13 +140,6 @@ class TelegramClient:
                 break
         return {"ok": False, "description": (last_desc or "telegram getUpdates failed")}
 
-    def send_text(self, text: str, *, parse_mode: str = "HTML") -> Optional[int]:
-        r = self.send_text_result(text, parse_mode=parse_mode)
-        if r.get("ok") and isinstance(r.get("result"), dict):
-            mid = r["result"].get("message_id")
-            return mid if isinstance(mid, int) else None
-        return None
-
     def send_text_result(self, text: str, *, parse_mode: str = "HTML", reply_markup: Optional[Dict[str, Any]] = None) -> Dict:
         payload = {
             "chat_id": self.chat_id,
