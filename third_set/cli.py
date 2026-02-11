@@ -2697,6 +2697,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         "keyboard": [
             ["Список live", "Анализ всех live"],
             ["Список upcoming", "Анализ upcoming"],
+            ["Анализ всех upcoming"],
             ["Анализ по ID", "Стоп текущий"],
             ["Перезапуск", "Выключить бота"],
         ],
@@ -3152,6 +3153,64 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 continue
         dt = int(time.time() - started)
         await send(f"Готово upcoming: ok={ok} skip={skipped} t={dt}s")
+
+    async def _analyze_all_upcoming(page: Page) -> None:
+        # Analyze exactly as cards are listed in Upcoming tab (DOM order).
+        cards = await _get_upcoming_cards(page, use_cache=False)
+        if not cards:
+            await send("Upcoming матчей не найдено.")
+            return
+
+        await send(f"Запускаю анализ всех upcoming… матчей={len(cards)}")
+        ok = 0
+        skipped = 0
+        skip_fetch = 0
+        skip_bad = 0
+        started = time.time()
+
+        for i, c in enumerate(cards, 1):
+            if stop_flag["stop"]:
+                break
+            eid = c.get("id")
+            home = str(c.get("homeName") or c.get("home") or "—")
+            away = str(c.get("awayName") or c.get("away") or "—")
+            print(f"[TG] analyze_all_upcoming: {i}/{len(cards)} id={eid} {home} vs {away}", flush=True)
+            if not isinstance(eid, int):
+                skipped += 1
+                skip_bad += 1
+                continue
+            try:
+                async with nav_lock:
+                    payload = await get_event_via_navigation(page, int(eid), timeout_ms=15_000)
+                ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+                if not isinstance(ev, dict) or not isinstance(ev.get("id"), int):
+                    skipped += 1
+                    skip_fetch += 1
+                    continue
+            except Exception:
+                skipped += 1
+                skip_fetch += 1
+                continue
+            try:
+                ok_one = await _analyze_event(page, ev)
+                if ok_one:
+                    ok += 1
+                else:
+                    skipped += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                skipped += 1
+                continue
+
+        dt = int(time.time() - started)
+        reasons: List[str] = []
+        if skip_fetch:
+            reasons.append(f"event_fetch_failed={skip_fetch}")
+        if skip_bad:
+            reasons.append(f"bad_card={skip_bad}")
+        extra = f"\nПричины пропуска: {', '.join(reasons)}" if reasons else ""
+        await send(f"Готово all upcoming: ok={ok} skip={skipped} t={dt}s{extra}")
 
     async def _analyze_event(page: Page, ev: Dict[str, Any]) -> bool:
         use_history_only = bool(history_only)
@@ -3680,6 +3739,16 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                                 "Выбери окно в часах: 1..10. Я возьму upcoming матчи, которые начнутся в этом окне, и посчитаю по истории.",
                                 reply_markup=upcoming_hours_markup,
                             )
+                            continue
+                        if _cmd_eq_or_prefix(text_cmd, ("анализ всех upcoming", "анализ всех предстоящих", "/analyze_all_upcoming")):
+                            _log_route(text, text_cmd, "analyze_all_upcoming")
+                            if os.getenv("THIRDSET_TG_LOG") in ("1", "true", "yes"):
+                                print("[TG] action: analyze_all_upcoming", flush=True)
+                            if active_task["task"] and not active_task["task"].done():
+                                await send("Уже выполняется задача. Нажми 'Стоп текущий' или дождись окончания.")
+                            else:
+                                stop_flag["stop"] = False
+                                _set_active_task(asyncio.create_task(_analyze_all_upcoming(page)))
                             continue
                         if _cmd_eq_or_prefix(text_cmd, ("анализ по id", "/analyze_id")):
                             _log_route(text, text_cmd, "analyze_by_id_prompt")
