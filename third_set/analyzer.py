@@ -2119,21 +2119,6 @@ async def _history_rows_for_player_audit(
                             "dom_error": (summary or {}).get("dom_error") if isinstance(summary, dict) else None,
                         }
                     )
-                # Strict history rule requested by user:
-                # if one of required 5 matches has no stats, stop this side immediately.
-                if slow_mode and len(valid_rows) < max_history and reason == "dom_stats_error":
-                    excluded_by_reason["missing_stats_in_required_five"] = (
-                        excluded_by_reason.get("missing_stats_in_required_five", 0) + 1
-                    )
-                    failfast_trigger = failfast_trigger or "missing_stats_in_required_five"
-                    _log_step(
-                        f"History[{progress_label or match_side}]: failfast missing stats "
-                        f"valid={len(valid_rows)}/{max_history} scanned={scanned}"
-                    )
-                    for tx in tasks:
-                        tx.cancel()
-                    tasks.clear()
-                    stop_side_now = True
             elif row is None:
                 consecutive_dom_timeouts = 0
                 consecutive_step_failures = 0
@@ -2236,9 +2221,6 @@ async def _history_rows_for_player_audit(
             # Launch next task only after fail-fast checks above.
             if len(valid_rows) < max_history:
                 await _launch_next()
-        if str(failfast_trigger or "").strip().lower() == "missing_stats_in_required_five":
-            break
-
         if len(valid_rows) >= max_history:
             # Cancel any remaining tasks; we have enough.
             for t in tasks:
@@ -2250,7 +2232,6 @@ async def _history_rows_for_player_audit(
     if (
         0 < len(valid_rows) < max_history
         and total_dom_timeouts <= 0
-        and str(failfast_trigger or "").strip().lower() != "missing_stats_in_required_five"
     ):
         retry_candidates: List[int] = []
         if isinstance(excluded_events, list):
@@ -2665,8 +2646,6 @@ async def analyze_once(
         # If one side has no valid rows and hit a strong failure signal,
         # skip the opposite side scan: comparison would be biased anyway.
         ff = str(getattr(audit, "failfast_trigger", "") or "").strip().lower()
-        if ff == "missing_stats_in_required_five":
-            return True
         if len(rows) > 0:
             return False
         exr = dict(getattr(audit, "excluded_by_reason", {}) or {})

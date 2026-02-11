@@ -3166,6 +3166,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         skipped = 0
         skip_fetch = 0
         skip_bad = 0
+        skip_not_singles = 0
         started = time.time()
 
         for i, c in enumerate(cards, 1):
@@ -3186,6 +3187,10 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 if not isinstance(ev, dict) or not isinstance(ev.get("id"), int):
                     skipped += 1
                     skip_fetch += 1
+                    continue
+                if not is_singles_event(ev):
+                    skipped += 1
+                    skip_not_singles += 1
                     continue
             except Exception:
                 skipped += 1
@@ -3209,6 +3214,8 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             reasons.append(f"event_fetch_failed={skip_fetch}")
         if skip_bad:
             reasons.append(f"bad_card={skip_bad}")
+        if skip_not_singles:
+            reasons.append(f"not_singles={skip_not_singles}")
         extra = f"\nПричины пропуска: {', '.join(reasons)}" if reasons else ""
         await send(f"Готово all upcoming: ok={ok} skip={skipped} t={dt}s{extra}")
 
@@ -3217,6 +3224,16 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         last_analyze_failure["code"] = None
         try:
             if stop_flag["stop"]:
+                return False
+            if not is_singles_event(ev):
+                last_analyze_failure["code"] = "not_singles"
+                home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
+                away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
+                await send(
+                    f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\n"
+                    "Недостаточно статистики.\ncode=not_singles\n"
+                    "Парные матчи не анализируются."
+                )
                 return False
             payload = {"event": ev}
             e = ev
