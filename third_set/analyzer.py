@@ -35,6 +35,7 @@ from third_set.sofascore import (
     get_event_via_navigation,
     parse_event_id_from_match_link,
     is_singles_event,
+    is_no_stats_tournament,
     summarize_event_for_team,
     warm_player_page,
     discover_player_match_links,
@@ -112,6 +113,62 @@ def _timeout_failfast_hits() -> int:
     except Exception:
         v = 4
     return max(1, min(6, v))
+
+
+# Process-local cache for resolved historical event payloads.
+# Reused across analyze calls in one bot/session run.
+_SESSION_RESOLVED_EVENT_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+_SESSION_RESOLVED_EVENT_CACHE_MAX = 5_000
+
+
+def _cache_key_for_link(link_s: str) -> Optional[str]:
+    if not isinstance(link_s, str):
+        return None
+    link_s = link_s.strip()
+    if not link_s:
+        return None
+    return f"link:{link_s.split('#', 1)[0]}"
+
+
+def _candidate_cache_keys(*, raw_eid: Any, link_s: str, candidate_key: Any) -> List[str]:
+    keys: List[str] = []
+    if isinstance(candidate_key, str) and candidate_key:
+        keys.append(candidate_key)
+    if isinstance(raw_eid, int):
+        keys.append(f"id:{int(raw_eid)}")
+    lk = _cache_key_for_link(link_s)
+    if lk:
+        keys.append(lk)
+    # Keep order and uniqueness.
+    dedup: List[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(k)
+    return dedup
+
+
+def _session_cache_get(keys: List[str]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    for k in keys:
+        if k in _SESSION_RESOLVED_EVENT_CACHE:
+            return True, _SESSION_RESOLVED_EVENT_CACHE.get(k)
+    return False, None
+
+
+def _session_cache_put(keys: List[str], value: Optional[Dict[str, Any]]) -> None:
+    if not keys:
+        return
+    # Soft FIFO trim by insertion order (dict order is insertion-ordered in py3.7+).
+    if len(_SESSION_RESOLVED_EVENT_CACHE) >= _SESSION_RESOLVED_EVENT_CACHE_MAX:
+        drop_n = max(1, _SESSION_RESOLVED_EVENT_CACHE_MAX // 5)
+        for i, k in enumerate(list(_SESSION_RESOLVED_EVENT_CACHE.keys())):
+            if i >= drop_n:
+                break
+            _SESSION_RESOLVED_EVENT_CACHE.pop(k, None)
+    for k in keys:
+        _SESSION_RESOLVED_EVENT_CACHE[k] = value
 
 
 def _score_from_history(
@@ -1324,6 +1381,8 @@ async def _history_rows_for_player_audit(
                 return "not_finished"
             if not is_singles_event(ev):
                 return "not_singles"
+            if is_no_stats_tournament(ev):
+                return "tournament_no_stats"
             if not require_period12:
                 return None
             hs = ev.get("homeScore") or {}
@@ -1345,6 +1404,9 @@ async def _history_rows_for_player_audit(
         if reason is not None:
             if reason == "stats_absent_likely":
                 excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
+            elif reason == "tournament_no_stats":
+                excluded_by_reason[reason] = excluded_by_reason.get(reason, 0) + 1
+                return False
             else:
                 return False
         ev_id = ev.get("id")
@@ -1599,21 +1661,37 @@ async def _history_rows_for_player_audit(
         if _event_needs_resolution(cur_ev):
             link_s = str(cur_ev.get("_candidate_link") or "").strip()
             raw_eid = cur_ev.get("id")
-            cache_key = str(cur_ev.get("_candidate_key") or (f"id:{raw_eid}" if isinstance(raw_eid, int) else f"link:{link_s}"))
-            cached = resolved_event_by_key.get(cache_key)
-            if cached is None and cache_key not in resolved_event_by_key:
-                try:
-                    if link_s:
-                        cached = await _resolve_event_from_link(link_s, resolve_page=hist_page)
-                    elif isinstance(raw_eid, int):
-                        base = _sofascore_base_from_url(hist_page.url or SOFASCORE_TENNIS_URL)
-                        fallback_link = f"{base}/event/{int(raw_eid)}#id:{int(raw_eid)}"
-                        cached = await _resolve_event_from_link(fallback_link, resolve_page=hist_page)
-                except Exception:
-                    cached = None
-                resolved_event_by_key[cache_key] = cached
-            elif cache_key in resolved_event_by_key:
-                cached = resolved_event_by_key.get(cache_key)
+            cache_keys = _candidate_cache_keys(
+                raw_eid=raw_eid,
+                link_s=link_s,
+                candidate_key=cur_ev.get("_candidate_key"),
+            )
+            local_hit = False
+            cached: Optional[Dict[str, Any]] = None
+            for ck in cache_keys:
+                if ck in resolved_event_by_key:
+                    local_hit = True
+                    cached = resolved_event_by_key.get(ck)
+                    break
+            if not local_hit:
+                session_hit, session_cached = _session_cache_get(cache_keys)
+                if session_hit:
+                    cached = session_cached
+                    for ck in cache_keys:
+                        resolved_event_by_key[ck] = cached
+                else:
+                    try:
+                        if link_s:
+                            cached = await _resolve_event_from_link(link_s, resolve_page=hist_page)
+                        elif isinstance(raw_eid, int):
+                            base = _sofascore_base_from_url(hist_page.url or SOFASCORE_TENNIS_URL)
+                            fallback_link = f"{base}/event/{int(raw_eid)}#id:{int(raw_eid)}"
+                            cached = await _resolve_event_from_link(fallback_link, resolve_page=hist_page)
+                    except Exception:
+                        cached = None
+                    for ck in cache_keys:
+                        resolved_event_by_key[ck] = cached
+                    _session_cache_put(cache_keys, cached)
             if isinstance(cached, dict):
                 merged = dict(cached)
                 for k in ("_candidate_link", "_candidate_key", "_candidate_source"):

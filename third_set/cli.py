@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import os.path
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 from html import escape as _html_escape
@@ -33,6 +34,8 @@ from third_set.sofascore import (
     get_event_statistics,
     get_last_finished_singles_events,
     is_singles_event,
+    is_no_stats_tournament,
+    get_prematch_tier,
     parse_event_id_from_match_link,
     summarize_event_for_team,
 )
@@ -67,6 +70,17 @@ def _runtime_build_stamp() -> str:
 
 _BUILD_STAMP = _runtime_build_stamp()
 _TG_RESTART_RC = 85
+
+try:
+    from zoneinfo import ZoneInfo
+
+    _MSK_TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    _MSK_TZ = timezone(timedelta(hours=3))
+try:
+    _MSK_DISPLAY_SHIFT_HOURS = int(os.getenv("THIRDSET_MSK_DISPLAY_SHIFT_HOURS") or "1")
+except Exception:
+    _MSK_DISPLAY_SHIFT_HOURS = 1
 
 
 def _print_audit(snapshot: MatchSnapshot) -> None:
@@ -177,10 +191,28 @@ def _dump_jsonl(path: Path, row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _fmt_start_msk(start_ts: Any) -> Optional[str]:
+    if not isinstance(start_ts, int):
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(start_ts), tz=timezone.utc).astimezone(_MSK_TZ)
+        if _MSK_DISPLAY_SHIFT_HOURS:
+            dt = dt + timedelta(hours=int(_MSK_DISPLAY_SHIFT_HOURS))
+        return dt.strftime("%d.%m %H:%M")
+    except Exception:
+        return None
+
+
+def _tg_start_line(start_ts: Any) -> str:
+    s = _fmt_start_msk(start_ts)
+    return f"\nНачало (МСК): {s}" if s else ""
+
+
 def _format_tg_message(
     *,
     event_id: int,
     match_url: str,
+    start_ts: Optional[int],
     home_name: str,
     away_name: str,
     set2_winner: str,
@@ -197,6 +229,9 @@ def _format_tg_message(
         f"{title}\n{link}\n<code>eventId={event_id}</code>"
         + (f"\n<code>build={_html_escape(build)}</code>" if build else "")
     )
+    start_line = _tg_start_line(start_ts)
+    if start_line:
+        header += f"\n<code>{_html_escape(start_line.strip())}</code>"
 
     stats_mode = str(meta.get("stats_mode") or "")
     summ = meta.get("summary") if isinstance(meta, dict) else None
@@ -217,6 +252,9 @@ def _format_tg_message(
         return m or "—"
 
     lines: List[str] = [header]
+    collect_elapsed_s = meta.get("collect_elapsed_s") if isinstance(meta, dict) else None
+    if isinstance(collect_elapsed_s, (int, float)):
+        lines.append(_line_kv("Время сбора статистики", f"{float(collect_elapsed_s):.1f}с"))
     lines.append(_line_kv("Режим", _mode_ru(stats_mode)))
     if set2_winner in ("home", "away", "neutral"):
         lines.append(_line_kv("Победил 2-й сет", {"home": "1", "away": "2", "neutral": "—"}.get(set2_winner, "—")))
@@ -2090,7 +2128,14 @@ async def cmd_analyze(
 
     async def run(page):
         send_policy = tg_send if tg_send in ("all", "bet") else "bet"
-        payload = await get_event_from_match_url_via_navigation(page, match_url=match_url, event_id=event_id)
+        try:
+            payload = await get_event_from_match_url_via_navigation(page, match_url=match_url, event_id=event_id)
+        except SofascoreError as ex:
+            msg = str(ex)
+            if "Timed out collecting: event" in msg:
+                payload = await get_event_via_navigation(page, int(event_id), timeout_ms=20_000)
+            else:
+                raise
         if audit:
             stats = await extract_statistics_dom(page, match_url=match_url.split("#id:")[0], event_id=event_id, periods=("1ST", "2ND"))
             print("AUDIT raw Sofascore stats (1ST/2ND):")
@@ -2214,6 +2259,7 @@ async def cmd_analyze(
                 msg = _format_tg_message(
                     event_id=ctx.event_id,
                     match_url=match_url.split("#id:")[0],
+                    start_ts=((payload.get("event") or {}).get("startTimestamp") if isinstance(payload, dict) else None),
                     home_name=ctx.home_name,
                     away_name=ctx.away_name,
                     set2_winner=ctx.set2_winner,
@@ -2475,6 +2521,7 @@ async def cmd_watch(
                             msg = _format_tg_message(
                                 event_id=ctx.event_id,
                                 match_url=ctx.url,
+                                start_ts=((payload.get("event") or {}).get("startTimestamp") if isinstance(payload, dict) else None),
                                 home_name=ctx.home_name,
                                 away_name=ctx.away_name,
                                 set2_winner=ctx.set2_winner,
@@ -2872,6 +2919,38 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 parts.append(f"{k}={v}")
         return parts
 
+    def _prematch_tier_priority(card_or_event: Dict[str, Any]) -> int:
+        tier = get_prematch_tier(card_or_event)
+        if tier == "atp_wta":
+            return 0
+        if tier == "challenger":
+            return 1
+        if tier == "utr":
+            return 2
+        return 3
+
+    def _upcoming_sort_key(item: Dict[str, Any]) -> tuple:
+        card = item.get("card") if isinstance(item, dict) else {}
+        ev = item.get("event") if isinstance(item, dict) else {}
+        source = card if isinstance(card, dict) and card else (ev if isinstance(ev, dict) else {})
+        tier_priority = _prematch_tier_priority(source if isinstance(source, dict) else {})
+        st = None
+        if isinstance(card, dict):
+            st = card.get("startTimestamp")
+        if not isinstance(st, int) and isinstance(ev, dict):
+            st = ev.get("startTimestamp")
+        st_key = int(st) if isinstance(st, int) else 2**62
+        eid = None
+        if isinstance(ev, dict):
+            eid = ev.get("id")
+        if not isinstance(eid, int) and isinstance(card, dict):
+            eid = card.get("id")
+        eid_key = int(eid) if isinstance(eid, int) else 2**62
+        return (tier_priority, st_key, eid_key)
+
+    def _upcoming_card_sort_key(card: Dict[str, Any]) -> tuple:
+        return _upcoming_sort_key({"card": card})
+
     def _is_upcoming_status(status: str) -> bool:
         s = str(status or "").strip().lower()
         if not s:
@@ -2919,6 +2998,17 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 card["awayName"] = (ev.get("awayTeam") or {}).get("name") or card.get("awayName")
                 card["awayId"] = (ev.get("awayTeam") or {}).get("id")
                 card["awaySlug"] = (ev.get("awayTeam") or {}).get("slug")
+            tournament = ev.get("tournament") or {}
+            unique_t = (tournament.get("uniqueTournament") or {}) if isinstance(tournament, dict) else {}
+            category = (tournament.get("category") or {}) if isinstance(tournament, dict) else {}
+            if isinstance(tournament, dict):
+                card["tournamentName"] = str(tournament.get("name") or "") or card.get("tournamentName")
+                card["tournamentSlug"] = str(tournament.get("slug") or "") or card.get("tournamentSlug")
+            if isinstance(unique_t, dict):
+                card["uniqueTournamentName"] = str(unique_t.get("name") or "") or card.get("uniqueTournamentName")
+                card["uniqueTournamentSlug"] = str(unique_t.get("slug") or "") or card.get("uniqueTournamentSlug")
+            if isinstance(category, dict):
+                card["categoryName"] = str(category.get("name") or "") or card.get("categoryName")
             card["enriched"] = True
         except Exception:
             card["enriched"] = bool(card.get("enriched")) and isinstance(card.get("startTimestamp"), int)
@@ -2946,6 +3036,27 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             ev["homeTeam"]["slug"] = card.get("homeSlug")
         if card.get("awaySlug"):
             ev["awayTeam"]["slug"] = card.get("awaySlug")
+        tournament_name = card.get("tournamentName")
+        unique_tournament_name = card.get("uniqueTournamentName")
+        category_name = card.get("categoryName")
+        tournament_slug = card.get("tournamentSlug")
+        unique_tournament_slug = card.get("uniqueTournamentSlug")
+        if any(v for v in (tournament_name, unique_tournament_name, category_name, tournament_slug, unique_tournament_slug)):
+            t: Dict[str, Any] = {}
+            if tournament_name:
+                t["name"] = tournament_name
+            if tournament_slug:
+                t["slug"] = tournament_slug
+            if unique_tournament_name or unique_tournament_slug:
+                ut: Dict[str, Any] = {}
+                if unique_tournament_name:
+                    ut["name"] = unique_tournament_name
+                if unique_tournament_slug:
+                    ut["slug"] = unique_tournament_slug
+                t["uniqueTournament"] = ut
+            if category_name:
+                t["category"] = {"name": category_name}
+            ev["tournament"] = t
         return ev
 
     async def _normalize_upcoming_for_analysis(
@@ -3014,12 +3125,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
 
             item = {"event": _upcoming_event_from_card(c), "card": c}
             eligible.append(item)
-        eligible.sort(
-            key=lambda it: (
-                int(((it.get("card") or {}).get("startTimestamp")) if isinstance((it.get("card") or {}).get("startTimestamp"), int) else 0),
-                int(((it.get("event") or {}).get("id")) if isinstance((it.get("event") or {}).get("id"), int) else 0),
-            )
-        )
+        eligible.sort(key=_upcoming_sort_key)
         eligible_total = len(eligible)
         if max_items is not None:
             eligible = eligible[: int(max_items)]
@@ -3155,13 +3261,14 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         await send(f"Готово upcoming: ok={ok} skip={skipped} t={dt}s")
 
     async def _analyze_all_upcoming(page: Page) -> None:
-        # Analyze exactly as cards are listed in Upcoming tab (DOM order).
+        # Analyze all upcoming with deterministic tier/time order.
         cards = await _get_upcoming_cards(page, use_cache=False)
         if not cards:
             await send("Upcoming матчей не найдено.")
             return
+        cards_sorted = sorted(list(cards), key=_upcoming_card_sort_key)
 
-        await send(f"Запускаю анализ всех upcoming… матчей={len(cards)}")
+        await send(f"Запускаю анализ всех upcoming… матчей={len(cards_sorted)}")
         ok = 0
         skipped = 0
         skip_fetch = 0
@@ -3169,13 +3276,13 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         skip_not_singles = 0
         started = time.time()
 
-        for i, c in enumerate(cards, 1):
+        for i, c in enumerate(cards_sorted, 1):
             if stop_flag["stop"]:
                 break
             eid = c.get("id")
             home = str(c.get("homeName") or c.get("home") or "—")
             away = str(c.get("awayName") or c.get("away") or "—")
-            print(f"[TG] analyze_all_upcoming: {i}/{len(cards)} id={eid} {home} vs {away}", flush=True)
+            print(f"[TG] analyze_all_upcoming: {i}/{len(cards_sorted)} id={eid} {home} vs {away}", flush=True)
             if not isinstance(eid, int):
                 skipped += 1
                 skip_bad += 1
@@ -3222,17 +3329,31 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     async def _analyze_event(page: Page, ev: Dict[str, Any]) -> bool:
         use_history_only = bool(history_only)
         last_analyze_failure["code"] = None
+        analyze_started = time.monotonic()
         try:
             if stop_flag["stop"]:
                 return False
+            start_line = _tg_start_line((ev or {}).get("startTimestamp"))
             if not is_singles_event(ev):
                 last_analyze_failure["code"] = "not_singles"
                 home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
                 away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
                 await send(
                     f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\n"
+                    f"{start_line}"
                     "Недостаточно статистики.\ncode=not_singles\n"
                     "Парные матчи не анализируются."
+                )
+                return False
+            if is_no_stats_tournament(ev):
+                last_analyze_failure["code"] = "no_stats_tournament"
+                home = str(((ev.get("homeTeam") or {}).get("name")) or "—")
+                away = str(((ev.get("awayTeam") or {}).get("name")) or "—")
+                await send(
+                    f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\n"
+                    f"{start_line}"
+                    "Недостаточно статистики.\ncode=no_stats_tournament\n"
+                    "Турнир уровня M15/W15/M25 — статистика не ведется."
                 )
                 return False
             payload = {"event": ev}
@@ -3299,9 +3420,11 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                     except Exception:
                         pass
                     meta["mode"] = "normal"
+                    meta["collect_elapsed_s"] = round(max(0.0, time.monotonic() - analyze_started), 1)
                     msg = _format_tg_message(
                         event_id=ctx.event_id,
                         match_url=ctx.url,
+                        start_ts=((e.get("startTimestamp")) if isinstance(e, dict) else None),
                         home_name=ctx.home_name,
                         away_name=ctx.away_name,
                         set2_winner=ctx.set2_winner,
@@ -3379,7 +3502,11 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 ex_text = re.sub(r"\s{2,}", " ", ex_text).strip()
             code_line = f"\ncode={code}" if code else ""
             last_analyze_failure["code"] = code or "sofascore_error"
-            await send(f"{home} vs {away}\nSofascore\neventId={eid}\nНедостаточно статистики.{code_line}\n{ex_text}")
+            elapsed_line = f"\nВремя сбора статистики: {max(0.0, time.monotonic() - analyze_started):.1f}с"
+            await send(
+                f"{home} vs {away}\nSofascore\neventId={eid}{_tg_start_line((ev or {}).get('startTimestamp'))}"
+                f"{elapsed_line}\nНедостаточно статистики.{code_line}\n{ex_text}"
+            )
             return False
         except asyncio.TimeoutError:
             # Keep a deterministic domain error in history-only mode.
@@ -3391,18 +3518,26 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             timeout_s = analyze_timeout_hist_s if use_history_only else analyze_timeout_s
             if use_history_only:
                 last_analyze_failure["code"] = "timeout_storm"
+                elapsed_line = f"\nВремя сбора статистики: {max(0.0, time.monotonic() - analyze_started):.1f}с"
                 await send(
                     f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\n"
+                    f"{_tg_start_line((ev or {}).get('startTimestamp'))}"
+                    f"{elapsed_line}\n"
                     f"Недостаточно статистики.\ncode=timeout_storm\n"
                     f"История не собрана: timeout storm (достигнут лимит анализа {timeout_s}s в history_only)."
                 )
                 return False
             last_analyze_failure["code"] = "analyze_timeout"
-            await send(f"{home} vs {away}\nSofascore\neventId={ev.get('id')}\nТаймаут анализа ({timeout_s}s).")
+            elapsed_line = f"\nВремя сбора статистики: {max(0.0, time.monotonic() - analyze_started):.1f}с"
+            await send(
+                f"{home} vs {away}\nSofascore\neventId={ev.get('id')}{_tg_start_line((ev or {}).get('startTimestamp'))}"
+                f"{elapsed_line}\nТаймаут анализа ({timeout_s}s)."
+            )
             return False
         except Exception as ex:
             last_analyze_failure["code"] = type(ex).__name__.lower() or "exception"
-            await send(f"Ошибка анализа id={ev.get('id')}: {ex}")
+            elapsed_line = f" (время сбора: {max(0.0, time.monotonic() - analyze_started):.1f}с)"
+            await send(f"Ошибка анализа id={ev.get('id')}: {ex}{elapsed_line}")
             return False
         return False
 

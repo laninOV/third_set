@@ -562,7 +562,6 @@ async def _dismiss_overlays(page: Page) -> None:
 
 
 async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
-    settle_ms = max(80, _DOM_READY_POLL_MS)
     await _wait_page_ready(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms + 4_000)
     await _dismiss_overlays(page)
     ov_state = await _consent_overlay_block_state(page)
@@ -619,7 +618,6 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                     tab = tl.get_by_role("tab", name=rx)
                     if await tab.count():
                         await tab.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                        await page.wait_for_timeout(settle_ms)
                         ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                         if not ok:
                             raise DomStatsError("step=statistics_tab: stats rows not ready after tab click")
@@ -645,7 +643,6 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                     if not (await loc.count()):
                         continue
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                    await page.wait_for_timeout(settle_ms)
                     ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                     if not ok:
                         raise DomStatsError("step=statistics_tab: stats rows not ready after role click")
@@ -657,7 +654,6 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
                 loc = root.locator("a,button,[role='tab'],[role='button'],[role='link']").filter(has_text=name_rx)
                 if await loc.count():
                     await loc.first.click(timeout=_UI_TIMEOUT_MS, force=True)
-                    await page.wait_for_timeout(settle_ms)
                     ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
                     if not ok:
                         raise DomStatsError("step=statistics_tab: stats rows not ready after css click")
@@ -684,8 +680,6 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
             """
         )
         if clicked:
-            await page.wait_for_timeout(settle_ms)
-            # Give the stats block time to hydrate.
             ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
             if not ok:
                 raise DomStatsError("step=statistics_tab: stats rows not ready after dom click")
@@ -705,16 +699,9 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
             }"""
         )
         if clicked:
-            await page.wait_for_timeout(max(100, int(settle_ms * 1.5)))
-            if await page.locator("#tabpanel-statistics").count():
-                ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
-                if not ok:
-                    raise DomStatsError("step=statistics_tab: stats rows not ready after js hash tab")
-                return
-            # Even if tabpanel id is missing, allow the extractor to continue (it falls back to document root).
             ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
             if not ok:
-                raise DomStatsError("step=statistics_tab: stats rows not ready after js href tab")
+                raise DomStatsError("step=statistics_tab: stats rows not ready after js hash tab")
             return
     except Exception:
         pass
@@ -731,15 +718,9 @@ async def _click_statistics_tab(page: Page, *, wait_stats_ms: int) -> None:
               } catch (e) {}
             }"""
         )
-        await page.wait_for_timeout(max(120, int(settle_ms * 1.5)))
         await _dismiss_overlays(page)
-        tabpanel = page.locator("#tabpanel-statistics")
-        # Do not require "visible": consent overlays can affect visibility checks.
-        if await tabpanel.count():
-            # Wait for content to populate.
-            ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
-            if not ok:
-                raise DomStatsError("step=statistics_tab: stats rows not ready after location hash")
+        ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
+        if ok:
             return
     except Exception:
         pass
@@ -812,7 +793,6 @@ async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) ->
             )
 
     async def _after_click() -> bool:
-        await page.wait_for_timeout(max(90, _DOM_READY_POLL_MS // 2))
         selected = await _wait_period_selected(page, period_code=period_code, timeout_ms=min(4500, _UI_TIMEOUT_MS + 2000))
         ok = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats_ms)
         if not ok:
@@ -953,11 +933,30 @@ async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) ->
                 except Exception:
                     pass
                 await cand.click(timeout=_UI_TIMEOUT_MS, force=True)
-                # Let the period control render (it may animate / portal-render).
+                # Wait by condition until period options appear (no fixed sleep).
                 try:
-                    await page.get_by_role("tab", name=re.compile(r"^1", re.I)).first.wait_for(timeout=1200)
+                    await page.wait_for_function(
+                        """
+                        (arg) => {
+                          const patterns = (arg?.patterns || []).map((x) => String(x || ''));
+                          if (!patterns.length) return false;
+                          const els = Array.from(document.querySelectorAll('button, a, [role="button"], [role="tab"], [role="link"], div, span'));
+                          const txt = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+                          return els.some((el) => {
+                            const t = txt(el.innerText || el.textContent || '');
+                            if (!t) return false;
+                            return patterns.some((pat) => {
+                              try { return new RegExp(pat, 'i').test(t); } catch (e) { return false; }
+                            });
+                          });
+                        }
+                        """,
+                        {"patterns": [p.pattern for p in patterns]},
+                        timeout=1_200,
+                        polling=max(80, _DOM_READY_POLL_MS),
+                    )
                 except Exception:
-                    await page.wait_for_timeout(1200)
+                    pass
                 for rx in patterns:
                     opt = page.locator("button, a, [role='button'], [role='tab'], [role='link'], div, span").filter(has_text=rx)
                     cnt = await opt.count()
@@ -1052,7 +1051,7 @@ async def extract_statistics_dom(
                     await page.wait_for_load_state("domcontentloaded", timeout=4_000)
                 except Exception:
                     pass
-                await page.wait_for_timeout(250)
+                await _wait_page_ready(page, timeout_ms=1_500)
                 if _HUMAN_PAUSE_MS > 0:
                     await page.wait_for_timeout(_HUMAN_PAUSE_MS)
                 if await _is_varnish_503(page):
@@ -1105,7 +1104,7 @@ async def extract_statistics_dom(
                 await page.wait_for_load_state("domcontentloaded", timeout=4_000)
             except Exception:
                 pass
-            await page.wait_for_timeout(250)
+            await _wait_page_ready(page, timeout_ms=1_500)
             if _HUMAN_PAUSE_MS > 0:
                 await page.wait_for_timeout(_HUMAN_PAUSE_MS)
             if await _is_varnish_503(page):
@@ -1139,7 +1138,6 @@ async def extract_statistics_dom(
     for attempt in range(step_retries + 1):
         try:
             await _click_statistics_tab(page, wait_stats_ms=wait_stats)
-            await page.wait_for_timeout(max(100, _DOM_READY_POLL_MS // 2))
             ok_rows = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats)
             if not ok_rows:
                 raise _dom_err(
@@ -1194,7 +1192,7 @@ async def extract_statistics_dom(
                     await btn.first.click(timeout=2500, force=True)
                 except Exception:
                     break
-                await page.wait_for_timeout(600)
+                await _wait_for_stats_rows(page, timeout_ms=min(1_500, _UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats))
     except Exception:
         pass
 
@@ -1204,10 +1202,10 @@ async def extract_statistics_dom(
         try:
             for _ in range(3):
                 await page.mouse.wheel(0, 1600)
-                await page.wait_for_timeout(max(120, int(_DOM_READY_POLL_MS * 1.2)))
+                await _wait_for_stats_rows(page, timeout_ms=max(200, int(_DOM_READY_POLL_MS * 2)))
             # Small scroll back up keeps header sections in view for stable DOM.
             await page.mouse.wheel(0, -2400)
-            await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
+            await _wait_for_stats_rows(page, timeout_ms=max(160, int(_DOM_READY_POLL_MS * 2)))
         except Exception:
             pass
 
@@ -1219,7 +1217,7 @@ async def extract_statistics_dom(
                 h = page.get_by_text(lab, exact=True)
                 if await h.count():
                     await h.first.scroll_into_view_if_needed(timeout=1500)
-                    await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
+                    await _wait_for_stats_rows(page, timeout_ms=max(160, int(_DOM_READY_POLL_MS * 2)))
                     break
         except Exception:
             pass
@@ -1227,7 +1225,7 @@ async def extract_statistics_dom(
         try:
             for _ in range(2):
                 await page.mouse.wheel(0, -1200)
-                await page.wait_for_timeout(max(80, _DOM_READY_POLL_MS))
+                await _wait_for_stats_rows(page, timeout_ms=max(160, int(_DOM_READY_POLL_MS * 2)))
         except Exception:
             pass
 
@@ -1551,7 +1549,7 @@ async def extract_statistics_dom(
                     await page.wait_for_selector("div.d_flex.ai_center.jc_space-between", timeout=_UI_TIMEOUT_MS + _SLOW_LOAD_MS)
                 except Exception:
                     pass
-                await page.wait_for_timeout(max(90, _DOM_READY_POLL_MS // 2))
+                await _wait_for_stats_rows(page, timeout_ms=max(250, int(_DOM_READY_POLL_MS * 2)))
                 groups_raw = await scrape_current_view()
                 if not isinstance(groups_raw, list):
                     raise _dom_err(

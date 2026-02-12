@@ -1646,6 +1646,9 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
             ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
             if not isinstance(ev, dict) or not ev:
                 continue
+            t = ev.get("tournament") or {}
+            ut = (t.get("uniqueTournament") or {}) if isinstance(t, dict) else {}
+            cat = (t.get("category") or {}) if isinstance(t, dict) else {}
             verified_by_id[int(eid)] = {
                 "status": str(((ev.get("status") or {}).get("type")) or "").lower() or None,
                 "startTimestamp": ev.get("startTimestamp"),
@@ -1659,6 +1662,11 @@ async def discover_upcoming_cards_dom(page: Page, *, limit: Optional[int] = None
                 "awayId": (ev.get("awayTeam") or {}).get("id"),
                 "homeSlug": (ev.get("homeTeam") or {}).get("slug"),
                 "awaySlug": (ev.get("awayTeam") or {}).get("slug"),
+                "tournamentName": str((t.get("name") if isinstance(t, dict) else "") or "") or None,
+                "uniqueTournamentName": str((ut.get("name") if isinstance(ut, dict) else "") or "") or None,
+                "categoryName": str((cat.get("name") if isinstance(cat, dict) else "") or "") or None,
+                "tournamentSlug": str((t.get("slug") if isinstance(t, dict) else "") or "") or None,
+                "uniqueTournamentSlug": str((ut.get("slug") if isinstance(ut, dict) else "") or "") or None,
             }
         except Exception:
             continue
@@ -1960,6 +1968,82 @@ def is_singles_event(ev: Dict[str, Any]) -> bool:
     if "doubles" in tournament_name.lower():
         return False
     return True
+
+
+def is_no_stats_tournament(ev: Dict[str, Any]) -> bool:
+    tournament = ev.get("tournament") or {}
+    name = str(tournament.get("name") or "")
+    unique = str(((tournament.get("uniqueTournament") or {}).get("name")) or "")
+    names = [name, unique]
+    tier_rx = re.compile(r"\b(m15|w15|m25)\b", re.I)
+    for raw in names:
+        if not raw:
+            continue
+        low = raw.lower()
+        if "itf" in low and tier_rx.search(low):
+            return True
+    return False
+
+
+def get_prematch_tier(ev_or_card: Dict[str, Any]) -> str:
+    """
+    Classify tournament tier for upcoming prematch ordering.
+    Returns one of: atp_wta, challenger, utr, other.
+    """
+    if not isinstance(ev_or_card, dict):
+        return "other"
+    raw_parts: List[str] = []
+    tournament = ev_or_card.get("tournament")
+    if isinstance(tournament, dict):
+        raw_parts.extend(
+            [
+                str(tournament.get("name") or ""),
+                str(tournament.get("slug") or ""),
+            ]
+        )
+        unique = tournament.get("uniqueTournament") or {}
+        if isinstance(unique, dict):
+            raw_parts.extend(
+                [
+                    str(unique.get("name") or ""),
+                    str(unique.get("slug") or ""),
+                ]
+            )
+        category = tournament.get("category") or {}
+        if isinstance(category, dict):
+            raw_parts.extend(
+                [
+                    str(category.get("name") or ""),
+                    str(category.get("slug") or ""),
+                ]
+            )
+    elif isinstance(tournament, str):
+        raw_parts.append(tournament)
+
+    # Card-level fallback fields (upcoming DOM cards).
+    for k in (
+        "seriesName",
+        "tournamentName",
+        "uniqueTournamentName",
+        "categoryName",
+        "tournamentSlug",
+        "uniqueTournamentSlug",
+    ):
+        v = ev_or_card.get(k)
+        if isinstance(v, str) and v.strip():
+            raw_parts.append(v)
+
+    hay = " ".join(raw_parts).lower()
+    if not hay.strip():
+        return "other"
+    # Priority of recognition matters: ATP Challenger should be Challenger tier.
+    if re.search(r"\bchallenger\b", hay, re.I):
+        return "challenger"
+    if re.search(r"\butr\b", hay, re.I):
+        return "utr"
+    if re.search(r"\b(atp|wta)(?:\s*\d+)?\b", hay, re.I):
+        return "atp_wta"
+    return "other"
 
 
 def pick_last_finished_singles_events(team_last_events: Dict[str, Any], *, limit: int) -> List[Dict[str, Any]]:
