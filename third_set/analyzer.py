@@ -119,6 +119,8 @@ def _timeout_failfast_hits() -> int:
 # Reused across analyze calls in one bot/session run.
 _SESSION_RESOLVED_EVENT_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _SESSION_RESOLVED_EVENT_CACHE_MAX = 5_000
+_SESSION_PLAYER_PROFILE_URLS_CACHE: Dict[int, Dict[str, str]] = {}
+_SESSION_PLAYER_MATCH_LINKS_CACHE: Dict[str, List[str]] = {}
 
 
 def _cache_key_for_link(link_s: str) -> Optional[str]:
@@ -169,6 +171,52 @@ def _session_cache_put(keys: List[str], value: Optional[Dict[str, Any]]) -> None
             _SESSION_RESOLVED_EVENT_CACHE.pop(k, None)
     for k in keys:
         _SESSION_RESOLVED_EVENT_CACHE[k] = value
+
+
+def _profile_urls_cache_get(event_id: Optional[int]) -> Optional[Dict[str, str]]:
+    if not isinstance(event_id, int):
+        return None
+    val = _SESSION_PLAYER_PROFILE_URLS_CACHE.get(int(event_id))
+    if not isinstance(val, dict):
+        return None
+    out: Dict[str, str] = {}
+    for side in ("home", "away"):
+        s = val.get(side)
+        if isinstance(s, str) and s:
+            out[side] = s
+    return out or None
+
+
+def _profile_urls_cache_put(event_id: Optional[int], prof: Dict[str, str]) -> None:
+    if not isinstance(event_id, int) or not isinstance(prof, dict):
+        return
+    out: Dict[str, str] = {}
+    for side in ("home", "away"):
+        s = prof.get(side)
+        if isinstance(s, str) and s:
+            out[side] = s
+    if out:
+        _SESSION_PLAYER_PROFILE_URLS_CACHE[int(event_id)] = out
+
+
+def _match_links_cache_get(profile_url: Optional[str], *, limit: int) -> Optional[List[str]]:
+    if not isinstance(profile_url, str) or not profile_url:
+        return None
+    cached = _SESSION_PLAYER_MATCH_LINKS_CACHE.get(profile_url)
+    if not isinstance(cached, list) or not cached:
+        return None
+    return list(cached[: max(1, int(limit))])
+
+
+def _match_links_cache_put(profile_url: Optional[str], links: List[str]) -> None:
+    if not isinstance(profile_url, str) or not profile_url:
+        return
+    out: List[str] = []
+    for u in links or []:
+        if isinstance(u, str) and u:
+            out.append(u)
+    if out:
+        _SESSION_PLAYER_MATCH_LINKS_CACHE[profile_url] = out[:2000]
 
 
 def _score_from_history(
@@ -1483,38 +1531,49 @@ async def _history_rows_for_player_audit(
     resolved_event_by_key: Dict[str, Optional[Dict[str, Any]]] = {}
     # 1) Try the player profile URL derived from the match page DOM (most reliable; avoids 404).
     if match_url and match_event_id and match_side in ("home", "away"):
-        try:
-            if no_limits_enabled and slow_mode:
-                prof = await discover_player_profile_urls_from_match(
-                    page, match_url=str(match_url), event_id=int(match_event_id)
-                )
-            else:
-                prof = await asyncio.wait_for(
-                    discover_player_profile_urls_from_match(page, match_url=str(match_url), event_id=int(match_event_id)),
-                    timeout=_candidate_timeout_s(3.0),
-                )
-        except Exception:
-            prof = {}
+        prof = _profile_urls_cache_get(int(match_event_id)) or {}
+        if prof:
+            _log_step(f"History[{progress_label or match_side}]: profile_url_cache=hit")
+        else:
+            try:
+                if no_limits_enabled and slow_mode:
+                    prof = await discover_player_profile_urls_from_match(
+                        page, match_url=str(match_url), event_id=int(match_event_id)
+                    )
+                else:
+                    prof = await asyncio.wait_for(
+                        discover_player_profile_urls_from_match(page, match_url=str(match_url), event_id=int(match_event_id)),
+                        timeout=_candidate_timeout_s(3.0),
+                    )
+            except Exception:
+                prof = {}
+            if isinstance(prof, dict) and prof:
+                _profile_urls_cache_put(int(match_event_id), prof)
         profile_url = prof.get(match_side) if isinstance(prof, dict) else None
         _log_step(
             f"History[{progress_label or match_side}]: profile_url={'yes' if isinstance(profile_url, str) and profile_url else 'no'}"
         )
         if isinstance(profile_url, str) and profile_url:
-            try:
-                # Player pages may contain many upcoming/live matches first; we need enough depth to reach finished ones.
-                if no_limits_enabled and slow_mode:
-                    links = await discover_player_match_links_from_profile_url(
-                        page, profile_url=profile_url, limit=link_limit
-                    )
-                else:
-                    links = await asyncio.wait_for(
-                        discover_player_match_links_from_profile_url(
+            links = _match_links_cache_get(profile_url, limit=link_limit) or []
+            if links:
+                _log_step(f"History[{progress_label or match_side}]: links_cache=hit n={len(links)}")
+            else:
+                try:
+                    # Player pages may contain many upcoming/live matches first; we need enough depth to reach finished ones.
+                    if no_limits_enabled and slow_mode:
+                        links = await discover_player_match_links_from_profile_url(
                             page, profile_url=profile_url, limit=link_limit
-                        ),
-                        timeout=_candidate_timeout_s(4.0),
-                    )
-            except Exception:
-                links = []
+                        )
+                    else:
+                        links = await asyncio.wait_for(
+                            discover_player_match_links_from_profile_url(
+                                page, profile_url=profile_url, limit=link_limit
+                            ),
+                            timeout=_candidate_timeout_s(4.0),
+                        )
+                except Exception:
+                    links = []
+                _match_links_cache_put(profile_url, links)
     _log_step(f"History[{progress_label or match_side}]: links={len(links)}")
     if not links:
         excluded_by_reason["profile_links_empty"] = 1
@@ -1849,20 +1908,37 @@ async def _history_rows_for_player_audit(
             except Exception as ex:
                 dom_err = f"{type(ex).__name__}: {ex}"
                 stats = None
+                if isinstance(ex, DomStatsError):
+                    try:
+                        summary = dict(summary)
+                        summary["dom_diag"] = dict(getattr(ex, "diag", {}) or {})
+                        summary["dom_code"] = str(getattr(ex, "code", "") or "").strip().lower() or None
+                    except Exception:
+                        pass
             finally:
                 dom_extract_ms = max(0.0, (loop.time() - dom_extract_started) * 1000.0)
 
-        if stats is None:
-            # Strict history: if we can't read per-set stats, skip and scan more candidates.
-            if dom_err:
-                summary = dict(summary)
-                summary["dom_error"] = dom_err
-                _log_step(f"History[{progress_label or match_side}]: dom_stats_error eid={eid} err={dom_err}")
-            if isinstance(summary, dict):
-                summary["_dom_attempted"] = bool(dom_attempted)
-                summary["_dom_extract_ms"] = float(dom_extract_ms)
-                summary["_dom_wasted"] = bool(dom_attempted)
-            return idx, None, "dom_stats_error", summary
+            if stats is None:
+                # Strict history: if we can't read per-set stats, skip and scan more candidates.
+                if dom_err:
+                    summary = dict(summary)
+                    summary["dom_error"] = dom_err
+                extra_diag = ""
+                try:
+                    d = dict(summary.get("dom_diag") or {}) if isinstance(summary, dict) else {}
+                    row_count = int(d.get("rowCount") or ((d.get("diag") or {}).get("rowCount") or 0))
+                    groups_n = int(d.get("groups_detected") or 0)
+                    p_tokens = list(d.get("period_tokens_detected") or [])[:4]
+                    if row_count or groups_n or p_tokens:
+                        extra_diag = f" rowCount={row_count} groups={groups_n} period_tokens={p_tokens}"
+                except Exception:
+                    extra_diag = ""
+                _log_step(f"History[{progress_label or match_side}]: dom_stats_error eid={eid} err={dom_err}{extra_diag}")
+                if isinstance(summary, dict):
+                    summary["_dom_attempted"] = bool(dom_attempted)
+                    summary["_dom_extract_ms"] = float(dom_extract_ms)
+                    summary["_dom_wasted"] = bool(dom_attempted)
+                return idx, None, "dom_stats_error", summary
 
         snap = MatchSnapshot(event_id=int(eid), stats=stats) if stats is not None else None
 
@@ -2162,7 +2238,22 @@ async def _history_rows_for_player_audit(
                         consecutive_statistics_tab_unreachable_hits = 0
                         last_ui_unavailable_code = None
                     if code == "stats_not_provided":
-                        stats_not_provided_hits += 1
+                        # Count as strong "stats absent" only when DOM confirms low/no rows.
+                        # If rows exist but period selection failed, treat as transient.
+                        confirmed_absent = False
+                        try:
+                            d = dict((summary or {}).get("dom_diag") or {}) if isinstance(summary, dict) else {}
+                            row_count = int(d.get("rowCount") or ((d.get("diag") or {}).get("rowCount") or 0))
+                            groups_n = int(d.get("groups_detected") or 0)
+                            confirmed_absent = (row_count < 8) and (groups_n <= 0)
+                        except Exception:
+                            confirmed_absent = True
+                        if confirmed_absent:
+                            stats_not_provided_hits += 1
+                        else:
+                            excluded_by_reason["stats_not_provided_unconfirmed"] = excluded_by_reason.get(
+                                "stats_not_provided_unconfirmed", 0
+                            ) + 1
                     timeout_like_codes = {"dom_extract_timeout", "scrape_eval_timeout"}
                     is_timeout_err = bool(code in timeout_like_codes) or (code is None and "TimeoutError" in derr)
                     is_varnish_503 = "503 backend read error" in derr

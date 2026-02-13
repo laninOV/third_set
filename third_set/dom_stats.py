@@ -68,6 +68,7 @@ try:
 except Exception:
     _DOM_READY_POLL_MS = 180
 _DOM_READY_POLL_MS = max(80, min(600, _DOM_READY_POLL_MS))
+_ROWCOUNT_STATS_PRESENT_THRESHOLD = 8
 
 
 def _dbg(msg: str) -> None:
@@ -322,8 +323,11 @@ async def _probe_stats_availability(page: Page) -> Dict[str, Any]:
               const hasEmptyMarker =
                 /нет статистик|no stat|statistics not available|no data available|данные отсутств|no match statistics/.test(txtAll);
               const hasAll = texts.some(t => /^(все|all)$/i.test(t));
-              const has1st = texts.some(t => /(1\\s*[-\\u2010-\\u2014]\\s*й(\\s*сет)?|1st(\\s*set)?|^\\s*1\\s*$)/i.test(t));
-              const has2nd = texts.some(t => /(2\\s*[-\\u2010-\\u2014]\\s*й(\\s*сет)?|2nd(\\s*set)?|^\\s*2\\s*$)/i.test(t));
+              const rx1 = /(1\\s*[-\\u2010-\\u2014]?\\s*й(\\s*сет)?|1st(\\s*set)?|set\\s*1|1\\s*set|^\\s*1\\s*$)/i;
+              const rx2 = /(2\\s*[-\\u2010-\\u2014]?\\s*й(\\s*сет)?|2nd(\\s*set)?|set\\s*2|2\\s*set|^\\s*2\\s*$)/i;
+              const has1st = texts.some(t => rx1.test(t));
+              const has2nd = texts.some(t => rx2.test(t));
+              const periodTokens = texts.filter(t => rx1.test(t) || rx2.test(t)).slice(0, 12);
               const groups = Array.from(root.querySelectorAll('h1,h2,h3,h4,span,div,p'))
                 .filter(isVisible)
                 .map(el => norm(el.textContent || ''))
@@ -332,7 +336,11 @@ async def _probe_stats_availability(page: Page) -> Dict[str, Any]:
               const rowCount = root.querySelectorAll(
                 'div.d_flex.ai_center.jc_space-between, div.d_flex.jc_space-between, div.jc_space-between, div[class*="statisticsRow"], div[class*="statRow"]'
               ).length;
-              const absentLikely = !!(hasEmptyMarker || ((!has1st || !has2nd) && groups.length === 0 && hasAll));
+              const rowsSuggestPresent = rowCount >= 8;
+              const absentLikely = !!(
+                hasEmptyMarker ||
+                ((!has1st || !has2nd) && groups.length === 0 && hasAll && !rowsSuggestPresent)
+              );
               return {
                 absent_likely: absentLikely,
                 has_empty_marker: hasEmptyMarker,
@@ -340,6 +348,8 @@ async def _probe_stats_availability(page: Page) -> Dict[str, Any]:
                 has_1st: has1st,
                 has_2nd: has2nd,
                 groups: groups,
+                groups_detected: groups.length,
+                period_tokens_detected: periodTokens,
                 rowCount: rowCount,
               };
             }
@@ -755,12 +765,16 @@ async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) ->
             return [
                 re.compile(rf"1\s*{dash}\s*й{set_word}", re.I),
                 re.compile(r"1st(?:\s*set)?", re.I),
+                re.compile(r"set\s*1", re.I),
+                re.compile(r"1\s*set", re.I),
                 re.compile(r"^\s*1\s*$", re.I),
             ]
         if code == "2ND":
             return [
                 re.compile(rf"2\s*{dash}\s*й{set_word}", re.I),
                 re.compile(r"2nd(?:\s*set)?", re.I),
+                re.compile(r"set\s*2", re.I),
+                re.compile(r"2\s*set", re.I),
                 re.compile(r"^\s*2\s*$", re.I),
             ]
         if code == "3RD":
@@ -785,7 +799,14 @@ async def _select_period(page: Page, period_code: str, *, wait_stats_ms: int) ->
         raise DomStatsError(f"step=period_select:{period_code}: unsupported period code")
     if period_code in ("1ST", "2ND"):
         avail = await _probe_stats_availability(page)
-        if isinstance(avail, dict) and bool(avail.get("absent_likely")):
+        row_count = int(avail.get("rowCount") or 0) if isinstance(avail, dict) else 0
+        groups_detected = int(avail.get("groups_detected") or 0) if isinstance(avail, dict) else 0
+        if (
+            isinstance(avail, dict)
+            and bool(avail.get("absent_likely"))
+            and row_count < _ROWCOUNT_STATS_PRESENT_THRESHOLD
+            and groups_detected <= 0
+        ):
             raise _dom_err(
                 step=f"select_period_{period_code.lower()}",
                 code="stats_not_provided",
@@ -1636,6 +1657,41 @@ async def extract_statistics_dom(
                     message=f"{type(ex).__name__}: {ex}",
                     diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
                 ) from ex
+        # Some pages expose rows but fail to switch period chips reliably (false "no stats").
+        # If we only see one top group while rows are present, retry opening statistics tab + period selection once.
+        try:
+            row_count_now = await page.evaluate(
+                """
+                () => {
+                  const root = document.querySelector('#tabpanel-statistics') || document;
+                  return root.querySelectorAll(
+                    'div.d_flex.ai_center.jc_space-between, div.d_flex.jc_space-between, div.jc_space-between, div[class*="statisticsRow"], div[class*="statRow"]'
+                  ).length;
+                }
+                """
+            )
+        except Exception:
+            row_count_now = 0
+        if isinstance(groups_raw, list) and len(groups_raw) <= 1 and int(row_count_now or 0) >= _ROWCOUNT_STATS_PRESENT_THRESHOLD:
+            _dbg(f"period {per}: weak groups_raw={len(groups_raw)} with rowCount={int(row_count_now or 0)}; retry period")
+            try:
+                await _click_statistics_tab(page, wait_stats_ms=wait_stats)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_timeout(max(160, _DOM_READY_POLL_MS))
+            except Exception:
+                pass
+            try:
+                _ = await _select_period(page, per, wait_stats_ms=wait_stats)
+            except Exception:
+                pass
+            try:
+                groups_raw_retry = await scrape_current_view()
+                if isinstance(groups_raw_retry, list) and len(groups_raw_retry) > len(groups_raw):
+                    groups_raw = groups_raw_retry
+            except Exception:
+                pass
         if not isinstance(groups_raw, list):
             continue
         _dbg(f"period {per}: groups_raw={len(groups_raw)}")
@@ -1716,12 +1772,19 @@ async def extract_statistics_dom(
         except Exception:
             diag = None
         code = "rows_not_ready"
+        row_count_diag = 0
+        groups_detected = 0
+        period_tokens_detected: List[str] = []
         try:
             period_vals = list(diag.get("period") or []) if isinstance(diag, dict) else []
+            row_count_diag = int(diag.get("rowCount") or 0) if isinstance(diag, dict) else 0
+            groups_detected = len(list(diag.get("groups") or [])) if isinstance(diag, dict) else 0
+            if isinstance(diag, dict):
+                period_tokens_detected = [str(x) for x in list(diag.get("period") or []) if str(x).strip()]
             joined = " ".join(str(x or "") for x in period_vals).lower()
-            has_p1 = bool(re.search(r"(1\s*[-\u2010-\u2014]\s*й|1st|\b1\b)", joined))
-            has_p2 = bool(re.search(r"(2\s*[-\u2010-\u2014]\s*й|2nd|\b2\b)", joined))
-            if not (has_p1 and has_p2):
+            has_p1 = bool(re.search(r"(1\s*[-\u2010-\u2014]?\s*й|1st|set\s*1|1\s*set|\b1\b)", joined))
+            has_p2 = bool(re.search(r"(2\s*[-\u2010-\u2014]?\s*й|2nd|set\s*2|2\s*set|\b2\b)", joined))
+            if (row_count_diag < _ROWCOUNT_STATS_PRESENT_THRESHOLD and groups_detected <= 0) and (not (has_p1 and has_p2)):
                 code = "stats_not_provided"
         except Exception:
             code = "rows_not_ready"
@@ -1732,7 +1795,14 @@ async def extract_statistics_dom(
             step="wait_rows_2nd",
             code=code,
             message=msg,
-            diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen, "diag": diag},
+            diag={
+                "elapsed_ms": _elapsed_ms(),
+                "varnish_503_seen": varnish_seen,
+                "diag": diag,
+                "rowCount": int(row_count_diag),
+                "groups_detected": int(groups_detected),
+                "period_tokens_detected": period_tokens_detected[:12],
+            },
         )
     diag_meta = {
         "step": f"extract_{str(periods[-1]).lower() if periods else 'unknown'}",

@@ -10,7 +10,7 @@ import time
 import os.path
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from html import escape as _html_escape
 
 from playwright.async_api import async_playwright
@@ -81,6 +81,89 @@ try:
     _MSK_DISPLAY_SHIFT_HOURS = int(os.getenv("THIRDSET_MSK_DISPLAY_SHIFT_HOURS") or "1")
 except Exception:
     _MSK_DISPLAY_SHIFT_HOURS = 1
+
+
+def _format_local_ts(st: Any) -> str:
+    if not isinstance(st, int):
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(st)))
+    except Exception:
+        return "-"
+
+
+def _sofascore_error_code(ex: SofascoreError) -> Tuple[Optional[str], str]:
+    ex_text = str(ex or "").strip()
+    lo = ex_text.lower()
+    m = re.search(r"\bcode=([a-z0-9_]+)\b", lo)
+    raw_code = m.group(1) if m else None
+    if "timeout storm" in lo:
+        raw_code = "timeout_storm"
+    elif "503 backend read error" in lo and not raw_code:
+        raw_code = "varnish_503"
+    elif "profile_links_empty" in lo and not raw_code:
+        raw_code = "profile_links_empty"
+    elif "no_finished_singles" in lo and not raw_code:
+        raw_code = "no_finished_singles"
+
+    source_blocked_codes = {"varnish_503", "cloudflare_block", "source_blocked"}
+    stats_absent_codes = {
+        "stats_absent",
+        "profile_links_empty",
+        "no_finished_singles",
+        "stats_absent_likely",
+        "stats_panel_absent",
+        "stats_rows_absent",
+        "stats_not_provided",
+    }
+    stats_not_loaded_codes = {
+        "stats_not_loaded",
+        "statistics_tab_unreachable",
+        "consent_overlay_blocked",
+        "dom_extract_timeout",
+        "period_select_failed",
+        "scrape_eval_timeout",
+        "rows_not_ready",
+        "navigation_failed",
+        "api_history_fetch_failed",
+    }
+    code = raw_code
+    if raw_code in source_blocked_codes or "cloudflare" in lo or "503 backend read error" in lo:
+        code = "source_blocked"
+    elif raw_code == "timeout_storm":
+        code = "timeout_storm"
+    elif raw_code in stats_absent_codes:
+        code = "stats_absent"
+    elif raw_code in stats_not_loaded_codes:
+        code = "stats_not_loaded"
+    if code:
+        ex_text = re.sub(r"\bcode=[a-z0-9_]+\b\s*", "", ex_text, flags=re.I).strip()
+        ex_text = re.sub(r"\s{2,}", " ", ex_text).strip()
+    return code, ex_text
+
+
+def _skip_reason_parts(
+    skip_reasons: Dict[str, int],
+    *,
+    base_keys: Tuple[str, ...],
+    include_codes: bool = True,
+    code_limit: int = 4,
+) -> List[str]:
+    parts: List[str] = []
+    for k in base_keys:
+        v = int(skip_reasons.get(k, 0) or 0)
+        if v > 0:
+            parts.append(f"{k}={v}")
+    if include_codes:
+        code_parts = sorted(
+            ((k, int(v)) for k, v in skip_reasons.items() if str(k).startswith("analyze_failed_") and int(v) > 0),
+            key=lambda kv: int(kv[1]),
+            reverse=True,
+        )
+        if code_parts:
+            top = ", ".join(f"{k.replace('analyze_failed_', '')}={v}" for k, v in code_parts[: max(1, int(code_limit))])
+            parts.append(f"codes[{top}]")
+    return parts
 
 
 def _print_audit(snapshot: MatchSnapshot) -> None:
@@ -2792,7 +2875,28 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     except Exception:
         poll_timeout_s = 8
     poll_timeout_s = max(1, min(50, poll_timeout_s))
+    try:
+        upcoming_heartbeat_every = int(os.getenv("THIRDSET_TG_UPCOMING_HEARTBEAT_EVERY") or "5")
+    except Exception:
+        upcoming_heartbeat_every = 5
+    upcoming_heartbeat_every = max(1, min(50, upcoming_heartbeat_every))
     no_limits_mode = os.getenv("THIRDSET_NO_LIMITS", "0").strip().lower() not in ("0", "false", "no")
+    print(
+        (
+            "TG bot: cfg "
+            f"history_only={int(bool(history_only))} "
+            f"max_history={int(max_history)} "
+            f"analyze_timeout_s={int(analyze_timeout_s)} "
+            f"analyze_timeout_history_only_s={int(analyze_timeout_hist_s)} "
+            f"poll_timeout_s={int(poll_timeout_s)} "
+            f"upcoming_heartbeat_every={int(upcoming_heartbeat_every)} "
+            f"no_limits={int(bool(no_limits_mode))} "
+            f"scan_initial={os.getenv('THIRDSET_HISTORY_SCAN_INITIAL', '10')} "
+            f"scan_chunk={os.getenv('THIRDSET_HISTORY_SCAN_CHUNK', '6')} "
+            f"scan_cap_balanced={os.getenv('THIRDSET_HISTORY_SCAN_CAP_BALANCED', '36')}"
+        ),
+        flush=True,
+    )
 
     async def send(text: str) -> None:
         # Optional debug prefix to detect “stale bot instance” issues.
@@ -3271,9 +3375,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
         await send(f"Запускаю анализ всех upcoming… матчей={len(cards_sorted)}")
         ok = 0
         skipped = 0
-        skip_fetch = 0
-        skip_bad = 0
-        skip_not_singles = 0
+        skip_reasons: Dict[str, int] = {}
         started = time.time()
 
         for i, c in enumerate(cards_sorted, 1):
@@ -3285,7 +3387,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
             print(f"[TG] analyze_all_upcoming: {i}/{len(cards_sorted)} id={eid} {home} vs {away}", flush=True)
             if not isinstance(eid, int):
                 skipped += 1
-                skip_bad += 1
+                skip_reasons["bad_card"] = skip_reasons.get("bad_card", 0) + 1
                 continue
             try:
                 async with nav_lock:
@@ -3293,15 +3395,25 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
                 if not isinstance(ev, dict) or not isinstance(ev.get("id"), int):
                     skipped += 1
-                    skip_fetch += 1
+                    skip_reasons["event_fetch_failed"] = skip_reasons.get("event_fetch_failed", 0) + 1
+                    continue
+                status_type = str(((ev.get("status") or {}).get("type")) or "").strip().lower()
+                if status_type and status_type != "notstarted":
+                    skipped += 1
+                    skip_reasons["status_not_upcoming"] = skip_reasons.get("status_not_upcoming", 0) + 1
                     continue
                 if not is_singles_event(ev):
                     skipped += 1
-                    skip_not_singles += 1
+                    skip_reasons["not_singles"] = skip_reasons.get("not_singles", 0) + 1
+                    continue
+                dpc = ev.get("defaultPeriodCount")
+                if isinstance(dpc, int) and dpc != 3:
+                    skipped += 1
+                    skip_reasons["not_bo3"] = skip_reasons.get("not_bo3", 0) + 1
                     continue
             except Exception:
                 skipped += 1
-                skip_fetch += 1
+                skip_reasons["event_fetch_failed"] = skip_reasons.get("event_fetch_failed", 0) + 1
                 continue
             try:
                 ok_one = await _analyze_event(page, ev)
@@ -3309,20 +3421,39 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                     ok += 1
                 else:
                     skipped += 1
+                    skip_reasons["analyze_failed"] = skip_reasons.get("analyze_failed", 0) + 1
+                    rcode = str(last_analyze_failure.get("code") or "").strip().lower()
+                    if rcode:
+                        key = f"analyze_failed_{rcode}"
+                        skip_reasons[key] = skip_reasons.get(key, 0) + 1
             except asyncio.CancelledError:
                 raise
             except Exception:
                 skipped += 1
+                skip_reasons["exception"] = skip_reasons.get("exception", 0) + 1
                 continue
+            processed = i
+            if processed % upcoming_heartbeat_every == 0:
+                dt = int(time.time() - started)
+                print(
+                    f"[TG] analyze_all_upcoming heartbeat: {processed}/{len(cards_sorted)} ok={ok} skip={skipped} t={dt}s",
+                    flush=True,
+                )
 
         dt = int(time.time() - started)
-        reasons: List[str] = []
-        if skip_fetch:
-            reasons.append(f"event_fetch_failed={skip_fetch}")
-        if skip_bad:
-            reasons.append(f"bad_card={skip_bad}")
-        if skip_not_singles:
-            reasons.append(f"not_singles={skip_not_singles}")
+        reasons = _skip_reason_parts(
+            skip_reasons,
+            base_keys=(
+                "bad_card",
+                "event_fetch_failed",
+                "status_not_upcoming",
+                "not_singles",
+                "not_bo3",
+                "analyze_failed",
+                "exception",
+            ),
+            include_codes=True,
+        )
         extra = f"\nПричины пропуска: {', '.join(reasons)}" if reasons else ""
         await send(f"Готово all upcoming: ok={ok} skip={skipped} t={dt}s{extra}")
 
@@ -3453,53 +3584,7 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
                 eid = ev.get("id")
             except Exception:
                 home, away, eid = "—", "—", ev.get("id")
-            ex_text = str(ex or "").strip()
-            lo = ex_text.lower()
-            m = re.search(r"\bcode=([a-z0-9_]+)\b", lo)
-            raw_code = m.group(1) if m else None
-            if "timeout storm" in lo:
-                raw_code = "timeout_storm"
-            elif "503 backend read error" in lo and not raw_code:
-                raw_code = "varnish_503"
-            elif "profile_links_empty" in lo and not raw_code:
-                raw_code = "profile_links_empty"
-            elif "no_finished_singles" in lo and not raw_code:
-                raw_code = "no_finished_singles"
-
-            source_blocked_codes = {"varnish_503", "cloudflare_block", "source_blocked"}
-            stats_absent_codes = {
-                "stats_absent",
-                "profile_links_empty",
-                "no_finished_singles",
-                "stats_absent_likely",
-                "stats_panel_absent",
-                "stats_rows_absent",
-                "stats_not_provided",
-            }
-            stats_not_loaded_codes = {
-                "stats_not_loaded",
-                "statistics_tab_unreachable",
-                "consent_overlay_blocked",
-                "dom_extract_timeout",
-                "period_select_failed",
-                "scrape_eval_timeout",
-                "rows_not_ready",
-                "navigation_failed",
-                "api_history_fetch_failed",
-            }
-            code = raw_code
-            if raw_code in source_blocked_codes or "cloudflare" in lo or "503 backend read error" in lo:
-                code = "source_blocked"
-            elif raw_code == "timeout_storm":
-                code = "timeout_storm"
-            elif raw_code in stats_absent_codes:
-                code = "stats_absent"
-            elif raw_code in stats_not_loaded_codes:
-                code = "stats_not_loaded"
-            if code:
-                # Avoid duplicating "code=..." in the next line: keep code only in code_line.
-                ex_text = re.sub(r"\bcode=[a-z0-9_]+\b\s*", "", ex_text, flags=re.I).strip()
-                ex_text = re.sub(r"\s{2,}", " ", ex_text).strip()
+            code, ex_text = _sofascore_error_code(ex)
             code_line = f"\ncode={code}" if code else ""
             last_analyze_failure["code"] = code or "sofascore_error"
             elapsed_line = f"\nВремя сбора статистики: {max(0.0, time.monotonic() - analyze_started):.1f}с"
@@ -4121,6 +4206,148 @@ async def cmd_probe_upcoming(*, hours: float, limit: int, headless: bool, profil
     return await _with_browser(headless, run, profile_dir=profile_dir)
 
 
+async def cmd_debug_upcoming_run(
+    *,
+    hours: float,
+    sample: int,
+    max_history: int,
+    history_only: bool,
+    headless: bool,
+    profile_dir: Optional[str] = None,
+) -> int:
+    async def run(page):
+        now = time.time()
+        horizon = now + max(0.25, float(hours)) * 3600.0
+        sample_n = max(1, min(50, int(sample)))
+        cards = await discover_upcoming_cards_dom(page, limit=None)
+        print(
+            f"DEBUG_UPCOMING_RUN: cards_dom={len(cards)} hours={float(hours):g} sample={sample_n} max_history={int(max_history)} history_only={int(bool(history_only))}",
+            flush=True,
+        )
+        if not cards:
+            return 0
+        cards_sorted = sorted(list(cards), key=lambda c: (int(c.get("startTimestamp") or 2**62), int(c.get("id") or 2**62)))
+        selected: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        prefilter_reasons: Dict[str, int] = {}
+        for c in cards_sorted:
+            eid = c.get("id")
+            if not isinstance(eid, int):
+                prefilter_reasons["bad_card"] = prefilter_reasons.get("bad_card", 0) + 1
+                continue
+            st = c.get("startTimestamp")
+            if not isinstance(st, int):
+                prefilter_reasons["no_start_time"] = prefilter_reasons.get("no_start_time", 0) + 1
+                continue
+            if st < int(now):
+                prefilter_reasons["scheduled_past_start"] = prefilter_reasons.get("scheduled_past_start", 0) + 1
+                continue
+            if st > horizon:
+                prefilter_reasons["outside_window"] = prefilter_reasons.get("outside_window", 0) + 1
+                continue
+            status = str(c.get("status") or "").strip().lower()
+            if status in ("inprogress", "finished", "canceled", "cancelled", "postponed"):
+                prefilter_reasons["status_not_upcoming"] = prefilter_reasons.get("status_not_upcoming", 0) + 1
+                continue
+            try:
+                payload = await get_event_via_navigation(page, int(eid), timeout_ms=20_000)
+            except Exception:
+                prefilter_reasons["event_fetch_failed"] = prefilter_reasons.get("event_fetch_failed", 0) + 1
+                continue
+            ev = (payload.get("event") or {}) if isinstance(payload, dict) else {}
+            if not isinstance(ev, dict) or not isinstance(ev.get("id"), int):
+                prefilter_reasons["event_fetch_failed"] = prefilter_reasons.get("event_fetch_failed", 0) + 1
+                continue
+            status_type = str(((ev.get("status") or {}).get("type")) or "").strip().lower()
+            if status_type and status_type != "notstarted":
+                prefilter_reasons["status_not_upcoming"] = prefilter_reasons.get("status_not_upcoming", 0) + 1
+                continue
+            if not is_singles_event(ev):
+                prefilter_reasons["not_singles"] = prefilter_reasons.get("not_singles", 0) + 1
+                continue
+            dpc = ev.get("defaultPeriodCount")
+            if isinstance(dpc, int) and dpc != 3:
+                prefilter_reasons["not_bo3"] = prefilter_reasons.get("not_bo3", 0) + 1
+                continue
+            selected.append((ev, c))
+            if len(selected) >= sample_n:
+                break
+        if prefilter_reasons:
+            p = ", ".join(_skip_reason_parts(prefilter_reasons, base_keys=tuple(sorted(prefilter_reasons.keys())), include_codes=False))
+            print(f"DEBUG_UPCOMING_RUN: prefilter_skips {p}", flush=True)
+        if not selected:
+            print("DEBUG_UPCOMING_RUN: no eligible singles BO3 matches in requested window", flush=True)
+            return 0
+        print(f"DEBUG_UPCOMING_RUN: selected={len(selected)}", flush=True)
+        timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "1200") if history_only else int(
+            os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "240"
+        )
+        ok = 0
+        failed = 0
+        fail_reasons: Dict[str, int] = {}
+        started = time.time()
+        for idx, (ev, c) in enumerate(selected, 1):
+            eid = int(ev.get("id"))
+            home = str(((ev.get("homeTeam") or {}).get("name")) or c.get("homeName") or c.get("home") or "—")
+            away = str(((ev.get("awayTeam") or {}).get("name")) or c.get("awayName") or c.get("away") or "—")
+            start_ts = ev.get("startTimestamp") if isinstance(ev.get("startTimestamp"), int) else c.get("startTimestamp")
+            tourn = str(((ev.get("tournament") or {}).get("name")) or c.get("tournamentName") or c.get("uniqueTournamentName") or "-")
+            slug = ev.get("slug")
+            custom = ev.get("customId")
+            base = _sofascore_base_from_url(page.url or SOFASCORE_TENNIS_URL)
+            match_url = f"{base}/tennis/match/{slug}/{custom}" if slug and custom else f"{base}/event/{eid}"
+            t0 = time.monotonic()
+            code = ""
+            try:
+                ctx, mods, _final_side, score, _meta = await asyncio.wait_for(
+                    analyze_once(
+                        page,
+                        event_payload={"event": ev},
+                        match_url=match_url,
+                        event_id=eid,
+                        max_history=int(max_history),
+                        history_only=bool(history_only),
+                        progress_cb=None,
+                        audit_history=False,
+                        audit_features=False,
+                    ),
+                    timeout=max(30, int(timeout_s)),
+                )
+                _decision, _decision_side = bet_decision(mods, score, mode="normal")
+                ok += 1
+                print(
+                    f"DEBUG_UPCOMING_RUN: {idx}/{len(selected)} id={eid} ok=1 code=ok dt={max(0.0, time.monotonic()-t0):.1f}s "
+                    f"start={_format_local_ts(start_ts)} | {ctx.home_name} vs {ctx.away_name} | tour={tourn}",
+                    flush=True,
+                )
+            except SofascoreError as ex:
+                code, _ = _sofascore_error_code(ex)
+                code = code or "sofascore_error"
+            except asyncio.TimeoutError:
+                code = "timeout_storm" if history_only else "analyze_timeout"
+            except Exception as ex:
+                code = type(ex).__name__.lower() or "exception"
+            if code:
+                failed += 1
+                key = f"analyze_failed_{code}"
+                fail_reasons[key] = fail_reasons.get(key, 0) + 1
+                print(
+                    f"DEBUG_UPCOMING_RUN: {idx}/{len(selected)} id={eid} ok=0 code={code} dt={max(0.0, time.monotonic()-t0):.1f}s "
+                    f"start={_format_local_ts(start_ts)} | {home} vs {away} | tour={tourn}",
+                    flush=True,
+                )
+        dt = int(time.time() - started)
+        summary = _skip_reason_parts(
+            {"analyze_failed": failed, **fail_reasons},
+            base_keys=("analyze_failed",),
+            include_codes=True,
+        )
+        extra = f" | {'; '.join(summary)}" if summary else ""
+        print(f"DEBUG_UPCOMING_RUN: done ok={ok} failed={failed} t={dt}s{extra}", flush=True)
+        return 0
+
+    return await _with_browser(headless, run, profile_dir=profile_dir)
+
+
 async def cmd_probe_stats(*, limit: int, headless: bool, profile_dir: Optional[str] = None) -> int:
     """
     Probe /api/v1/event/<id>/statistics across live tennis matches.
@@ -4471,6 +4698,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_probe_up.add_argument("--hours", type=float, default=24.0, help="Upcoming window in hours (default 24)")
     p_probe_up.add_argument("--limit", type=int, default=20, help="Max cards to inspect (default 20)")
 
+    p_debug_up = sub.add_parser("debug-upcoming-run", help="Run deterministic debug analysis for sampled upcoming singles BO3")
+    p_debug_up.add_argument("--hours", type=float, default=24.0, help="Upcoming window in hours (default 24)")
+    p_debug_up.add_argument("--sample", type=int, default=10, help="How many eligible upcoming matches to analyze (default 10)")
+    p_debug_up.add_argument("--max-history", type=int, default=5, help="History pool per player (default 5)")
+    p_debug_up.add_argument(
+        "--history-only",
+        action="store_true",
+        default=True,
+        help="Analyze using ONLY historical data (default true for server stability)",
+    )
+    p_debug_up.add_argument(
+        "--with-current",
+        action="store_false",
+        dest="history_only",
+        help="Also use current match DOM statistics (disables history-only mode)",
+    )
+
     args = parser.parse_args(argv)
     headless = not args.headed
     profile_dir = (args.profile_dir or "").strip() or None
@@ -4570,6 +4814,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return asyncio.run(cmd_probe_dom(limit=args.limit, headless=headless, profile_dir=profile_dir, seen=args.seen))
     if args.cmd == "probe-upcoming":
         return asyncio.run(cmd_probe_upcoming(hours=args.hours, limit=args.limit, headless=headless, profile_dir=profile_dir))
+    if args.cmd == "debug-upcoming-run":
+        return asyncio.run(
+            cmd_debug_upcoming_run(
+                hours=args.hours,
+                sample=args.sample,
+                max_history=args.max_history,
+                history_only=args.history_only,
+                headless=headless,
+                profile_dir=profile_dir,
+            )
+        )
     raise SystemExit(2)
 
 
