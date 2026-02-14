@@ -279,6 +279,11 @@ def _format_tg_message(
     if set2_winner in ("home", "away", "neutral"):
         lines.append(_line_kv("Победил 2-й сет", {"home": "1", "away": "2", "neutral": "—"}.get(set2_winner, "—")))
     hdiag = meta.get("history_diag") if isinstance(meta, dict) else None
+    diag_debug_enabled = os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes") or os.getenv("THIRDSET_TG_LOG") in (
+        "1",
+        "true",
+        "yes",
+    )
     if isinstance(hdiag, dict):
         for side in ("home", "away"):
             d = hdiag.get(side)
@@ -293,6 +298,20 @@ def _format_tg_message(
             if any(isinstance(x, int) and x > 0 for x in (t, s, v)):
                 lines.append(
                     f"<code>diag: side={side} code={c or '-'} timeouts={int(t or 0)} scanned={int(s or 0)} valid={int(v or 0)} resets={int(r or 0)} budget_hit={'yes' if b else 'no'}</code>"
+                )
+            if diag_debug_enabled:
+                try:
+                    spent_s = float(d.get("spent_s") or 0.0)
+                    dom_total_ms = float(d.get("dom_extract_ms_total") or 0.0)
+                    dom_p95_ms = float(d.get("dom_extract_ms_p95") or 0.0)
+                    wasted = int(d.get("wasted_dom_attempts") or 0)
+                except Exception:
+                    spent_s = 0.0
+                    dom_total_ms = 0.0
+                    dom_p95_ms = 0.0
+                    wasted = 0
+                lines.append(
+                    f"<code>timing: side={side} spent={spent_s:.1f}s dom_total={int(round(dom_total_ms))}ms dom_p95={int(round(dom_p95_ms))}ms wasted={wasted}</code>"
                 )
 
     def _pp(x: Any) -> Optional[float]:
@@ -2773,9 +2792,9 @@ async def cmd_tg_bot(*, max_history: int, headless: bool, profile_dir: Optional[
     except Exception:
         analyze_timeout_s = 240
     try:
-        analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "1200")
+        analyze_timeout_hist_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "420")
     except Exception:
-        analyze_timeout_hist_s = 1200
+        analyze_timeout_hist_s = 420
     try:
         poll_timeout_s = int(os.getenv("THIRDSET_TG_POLL_TIMEOUT_S") or "8")
     except Exception:
@@ -4184,7 +4203,7 @@ async def cmd_debug_upcoming_run(
             print("DEBUG_UPCOMING_RUN: no eligible singles BO3 matches in requested window", flush=True)
             return 0
         print(f"DEBUG_UPCOMING_RUN: selected={len(selected)}", flush=True)
-        timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "1200") if history_only else int(
+        timeout_s = int(os.getenv("THIRDSET_ANALYZE_TIMEOUT_HISTORY_ONLY_S") or "420") if history_only else int(
             os.getenv("THIRDSET_ANALYZE_TIMEOUT_S") or "240"
         )
         ok = 0

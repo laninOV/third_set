@@ -71,6 +71,33 @@ _DOM_READY_POLL_MS = max(80, min(600, _DOM_READY_POLL_MS))
 _ROWCOUNT_STATS_PRESENT_THRESHOLD = 8
 
 
+def _resolve_step_retries(
+    *,
+    step_retries_default: int,
+    goto_retries: Optional[int] = None,
+    open_tab_retries: Optional[int] = None,
+    period_retries: Optional[int] = None,
+) -> Dict[str, int]:
+    def _parse_env(name: str) -> Optional[int]:
+        raw = os.getenv(name)
+        if raw in (None, ""):
+            return None
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    base = max(0, min(6, int(step_retries_default)))
+    goto_v = goto_retries if isinstance(goto_retries, int) else _parse_env("THIRDSET_DOM_STEP_RETRIES_GOTO")
+    open_v = open_tab_retries if isinstance(open_tab_retries, int) else _parse_env("THIRDSET_DOM_STEP_RETRIES_OPEN_TAB")
+    period_v = period_retries if isinstance(period_retries, int) else _parse_env("THIRDSET_DOM_STEP_RETRIES_PERIOD")
+    return {
+        "goto_match": max(0, min(6, int(goto_v if isinstance(goto_v, int) else base))),
+        "open_statistics_tab": max(0, min(6, int(open_v if isinstance(open_v, int) else base))),
+        "select_period": max(0, min(6, int(period_v if isinstance(period_v, int) else base))),
+    }
+
+
 def _dbg(msg: str) -> None:
     if os.getenv("THIRDSET_DEBUG") in ("1", "true", "yes"):
         print(f"[dom] {msg}", flush=True)
@@ -1021,6 +1048,9 @@ async def extract_statistics_dom(
     periods: Tuple[str, ...] = ("1ST", "2ND"),
     nav_timeout_ms: Optional[int] = None,
     wait_stats_ms: Optional[int] = None,
+    goto_retries: Optional[int] = None,
+    open_tab_retries: Optional[int] = None,
+    period_retries: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Extract per-period tennis statistics from Sofascore DOM ("Статистика" tab).
@@ -1039,6 +1069,12 @@ async def extract_statistics_dom(
     except Exception:
         step_retries = 2
     step_retries = max(0, min(6, step_retries))
+    step_retries_by_step = _resolve_step_retries(
+        step_retries_default=step_retries,
+        goto_retries=goto_retries,
+        open_tab_retries=open_tab_retries,
+        period_retries=period_retries,
+    )
     try:
         step_backoff_ms = int(os.getenv("THIRDSET_DOM_STEP_BACKOFF_MS") or "350")
     except Exception:
@@ -1065,7 +1101,8 @@ async def extract_statistics_dom(
     if not on_same_match or not has_event_fragment:
         _dbg(f"goto {target}")
         last_err: Optional[Exception] = None
-        for attempt in range(step_retries + 1):
+        goto_step_retries = int(step_retries_by_step.get("goto_match") or 0)
+        for attempt in range(goto_step_retries + 1):
             try:
                 await _safe_goto(page, target, timeout_ms=nav_timeout)
                 try:
@@ -1078,8 +1115,8 @@ async def extract_statistics_dom(
                 if await _is_varnish_503(page):
                     varnish_seen = True
                     wait_ms = step_backoff_ms * (attempt + 1)
-                    _dbg(f"varnish_503: retry in {wait_ms}ms (attempt {attempt+1}/{step_retries+1})")
-                    if attempt >= step_retries:
+                    _dbg(f"varnish_503: retry in {wait_ms}ms (attempt {attempt+1}/{goto_step_retries+1})")
+                    if attempt >= goto_step_retries:
                         raise _dom_err(
                             step="goto_match",
                             code="varnish_503",
@@ -1099,7 +1136,7 @@ async def extract_statistics_dom(
                 if want_id and have_id == want_id:
                     last_err = None
                     break
-                if attempt >= step_retries:
+                if attempt >= goto_step_retries:
                     raise _dom_err(
                         step="goto_match",
                         code="navigation_failed",
@@ -1156,7 +1193,8 @@ async def extract_statistics_dom(
     wait_stats = int(wait_stats_ms) if isinstance(wait_stats_ms, int) and wait_stats_ms > 0 else _WAIT_STATS_MS
     stats_opened = False
     open_err: Optional[Exception] = None
-    for attempt in range(step_retries + 1):
+    open_step_retries = int(step_retries_by_step.get("open_statistics_tab") or 0)
+    for attempt in range(open_step_retries + 1):
         try:
             await _click_statistics_tab(page, wait_stats_ms=wait_stats)
             ok_rows = await _wait_for_stats_rows(page, timeout_ms=_UI_TIMEOUT_MS + _SLOW_LOAD_MS + wait_stats)
@@ -1173,12 +1211,12 @@ async def extract_statistics_dom(
             break
         except DomStatsError as ex:
             open_err = ex
-            if attempt >= step_retries:
+            if attempt >= open_step_retries:
                 break
             await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
         except Exception as ex:
             open_err = ex
-            if attempt >= step_retries:
+            if attempt >= open_step_retries:
                 break
             await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
     if not stats_opened:
@@ -1550,11 +1588,12 @@ async def extract_statistics_dom(
     out_periods: List[Dict[str, Any]] = []
     meta_seen: Dict[str, Any] = {}
     meta_unmapped: Dict[str, Any] = {}
+    period_step_retries = int(step_retries_by_step.get("select_period") or 0)
     for per in periods:
         groups_raw: List[Dict[str, Any]] = []
         selected = False
         select_err: Optional[Exception] = None
-        for attempt in range(step_retries + 1):
+        for attempt in range(period_step_retries + 1):
             try:
                 selected = await _select_period(page, per, wait_stats_ms=wait_stats)
                 if not selected:
@@ -1590,7 +1629,7 @@ async def extract_statistics_dom(
                     message=f"{type(ex).__name__}: {ex}",
                     diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
                 )
-                if attempt >= step_retries:
+                if attempt >= period_step_retries:
                     raise select_err from ex
                 await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
             except DomStatsError as ex:
@@ -1604,7 +1643,7 @@ async def extract_statistics_dom(
                         message=str(ex),
                         diag={"elapsed_ms": _elapsed_ms(), "varnish_503_seen": varnish_seen},
                     ) from ex
-                if attempt >= step_retries:
+                if attempt >= period_step_retries:
                     raise _dom_err(
                         step=f"select_period_{per.lower()}",
                         code="period_select_failed",
@@ -1615,7 +1654,7 @@ async def extract_statistics_dom(
                 await page.wait_for_timeout(step_backoff_ms * (attempt + 1))
             except Exception as ex:
                 select_err = ex
-                if attempt >= step_retries:
+                if attempt >= period_step_retries:
                     raise _dom_err(
                         step=f"extract_{per.lower()}",
                         code="scrape_eval_timeout",

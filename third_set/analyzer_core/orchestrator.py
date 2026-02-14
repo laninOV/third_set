@@ -87,6 +87,28 @@ def _timeout_failfast_hits() -> int:
     return max(1, min(6, v))
 
 
+def _should_restore_wait_stats(*, wait_stats_ms: Optional[int], wait_stats_base_ms: int, success_streak: int) -> bool:
+    if not isinstance(wait_stats_ms, int):
+        return False
+    return wait_stats_ms > int(wait_stats_base_ms) and int(success_streak) >= 2
+
+
+def _should_enable_final_attempt_guard(
+    *,
+    slow_mode: bool,
+    no_limits_enabled: bool,
+    have_valid: int,
+    max_history: int,
+    remaining_side_s: float,
+    per_event_timeout_s: float,
+) -> bool:
+    if not slow_mode or no_limits_enabled:
+        return False
+    if int(have_valid) < max(1, int(max_history) - 1):
+        return False
+    return float(remaining_side_s) < float(per_event_timeout_s)
+
+
 # Process-local cache for resolved historical event payloads.
 # Reused across analyze calls in one bot/session run.
 _SESSION_RESOLVED_EVENT_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -1288,7 +1310,7 @@ async def _history_rows_for_player_audit(
     # If we can't collect enough rows within budget, we return what we have (no fake filling).
     raw_per_event = os.getenv("THIRDSET_HISTORY_EVENT_TIMEOUT_S")
     raw_per_event_hist = os.getenv("THIRDSET_HISTORY_EVENT_TIMEOUT_S_HISTORY_ONLY")
-    default_per_event = "22" if (slow_mode and failfast_enabled) else "18"
+    default_per_event = "14" if (slow_mode and failfast_enabled) else "18"
     selected_per_event = raw_per_event
     if slow_mode and raw_per_event_hist not in (None, ""):
         selected_per_event = raw_per_event_hist
@@ -1318,21 +1340,52 @@ async def _history_rows_for_player_audit(
 
     try:
         wait_stats_base_ms = int(
-            os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS") or ("1800" if slow_mode else "0")
+            os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS") or ("900" if slow_mode else "0")
         )
     except Exception:
-        wait_stats_base_ms = 1800 if slow_mode else 0
+        wait_stats_base_ms = 900 if slow_mode else 0
     try:
-        wait_stats_fallback_ms = int(os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS_FALLBACK") or "3500")
+        wait_stats_fallback_ms = int(os.getenv("THIRDSET_HISTORY_WAIT_STATS_MS_FALLBACK") or "2000")
     except Exception:
         wait_stats_fallback_ms = 3500
     wait_stats_base_ms = max(0, min(20_000, wait_stats_base_ms))
     wait_stats_fallback_ms = max(wait_stats_base_ms, min(25_000, wait_stats_fallback_ms))
     wait_stats_ms: Optional[int] = wait_stats_base_ms if slow_mode else None
+    dom_retry_goto_slow = 2
+    dom_retry_open_slow = 1
+    dom_retry_period_slow = 1
+    if slow_mode:
+        try:
+            dom_retry_goto_slow = int(
+                os.getenv("THIRDSET_DOM_STEP_RETRIES_GOTO_HISTORY_ONLY")
+                or os.getenv("THIRDSET_DOM_STEP_RETRIES_GOTO")
+                or "2"
+            )
+        except Exception:
+            dom_retry_goto_slow = 2
+        try:
+            dom_retry_open_slow = int(
+                os.getenv("THIRDSET_DOM_STEP_RETRIES_OPEN_TAB_HISTORY_ONLY")
+                or os.getenv("THIRDSET_DOM_STEP_RETRIES_OPEN_TAB")
+                or "1"
+            )
+        except Exception:
+            dom_retry_open_slow = 1
+        try:
+            dom_retry_period_slow = int(
+                os.getenv("THIRDSET_DOM_STEP_RETRIES_PERIOD_HISTORY_ONLY")
+                or os.getenv("THIRDSET_DOM_STEP_RETRIES_PERIOD")
+                or "1"
+            )
+        except Exception:
+            dom_retry_period_slow = 1
+    dom_retry_goto_slow = max(0, min(6, int(dom_retry_goto_slow)))
+    dom_retry_open_slow = max(0, min(6, int(dom_retry_open_slow)))
+    dom_retry_period_slow = max(0, min(6, int(dom_retry_period_slow)))
 
     raw_player_budget = os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S")
     raw_player_budget_hist = os.getenv("THIRDSET_HISTORY_PLAYER_BUDGET_S_HISTORY_ONLY")
-    default_player_budget = "90" if (slow_mode and failfast_enabled) else "75"
+    default_player_budget = "70" if (slow_mode and failfast_enabled) else "75"
     selected_player_budget = raw_player_budget
     if slow_mode and raw_player_budget_hist not in (None, ""):
         selected_player_budget = raw_player_budget_hist
@@ -1365,11 +1418,11 @@ async def _history_rows_for_player_audit(
         candidate_mult = 12
     candidate_mult = max(6, min(40, candidate_mult))
     try:
-        scan_initial_cfg = int(os.getenv("THIRDSET_HISTORY_SCAN_INITIAL") or "12")
+        scan_initial_cfg = int(os.getenv("THIRDSET_HISTORY_SCAN_INITIAL") or "10")
     except Exception:
         scan_initial_cfg = 12
     try:
-        scan_chunk_cfg = int(os.getenv("THIRDSET_HISTORY_SCAN_CHUNK") or "6")
+        scan_chunk_cfg = int(os.getenv("THIRDSET_HISTORY_SCAN_CHUNK") or "4")
     except Exception:
         scan_chunk_cfg = 6
     try:
@@ -1943,6 +1996,20 @@ async def _history_rows_for_player_audit(
 
         # History statistics: STRICT DOM-only.
         # User requirement: maximum completeness and CF stability; no /api/v1/... fetches for history stats.
+        final_attempt_mode = bool(cur_ev.get("_final_attempt_mode")) if isinstance(cur_ev, dict) else False
+        event_wait_stats_ms = wait_stats_ms
+        event_retry_goto: Optional[int] = None
+        event_retry_open: Optional[int] = None
+        event_retry_period: Optional[int] = None
+        if slow_mode:
+            event_retry_goto = dom_retry_goto_slow
+            event_retry_open = dom_retry_open_slow
+            event_retry_period = dom_retry_period_slow
+            if final_attempt_mode:
+                event_wait_stats_ms = wait_stats_base_ms
+                event_retry_goto = min(1, dom_retry_goto_slow)
+                event_retry_open = 0
+                event_retry_period = 0
         stats = None
         dom_used = False
         dom_attempted = False
@@ -1969,7 +2036,10 @@ async def _history_rows_for_player_audit(
                             event_id=int(eid),
                             periods=periods,
                             nav_timeout_ms=_nav_timeout_ms(max(45.0, per_event_timeout_s)),
-                            wait_stats_ms=wait_stats_ms,
+                            wait_stats_ms=event_wait_stats_ms,
+                            goto_retries=event_retry_goto,
+                            open_tab_retries=event_retry_open,
+                            period_retries=event_retry_period,
                         )
                     else:
                         stats = await asyncio.wait_for(
@@ -1979,7 +2049,7 @@ async def _history_rows_for_player_audit(
                                 event_id=int(eid),
                                 periods=periods,
                                 nav_timeout_ms=_nav_timeout_ms(per_event_timeout_s),
-                                wait_stats_ms=wait_stats_ms,
+                                wait_stats_ms=event_wait_stats_ms,
                             ),
                             timeout=per_event_timeout_s,
                         )
@@ -2001,6 +2071,13 @@ async def _history_rows_for_player_audit(
                         retry_t = min(18.0, max(10.0, per_event_timeout_s * 0.8))
                     else:
                         retry_t = min(30.0, max(per_event_timeout_s * 1.5, per_event_timeout_s + 6.0))
+                    if final_attempt_mode:
+                        raise DomStatsError(
+                            timeout_msg,
+                            step="extract_statistics",
+                            code="dom_extract_timeout",
+                            diag={"timeout_s": float(per_event_timeout_s), "final_attempt_mode": True},
+                        )
                     _log_step(f"History[{progress_label or match_side}]: retry stats eid={eid} t={retry_t}")
                     try:
                         stats = await asyncio.wait_for(
@@ -2010,7 +2087,10 @@ async def _history_rows_for_player_audit(
                                 event_id=int(eid),
                                 periods=periods,
                                 nav_timeout_ms=_nav_timeout_ms(retry_t),
-                                wait_stats_ms=wait_stats_ms,
+                                wait_stats_ms=event_wait_stats_ms,
+                                goto_retries=event_retry_goto,
+                                open_tab_retries=event_retry_open,
+                                period_retries=event_retry_period,
                             ),
                             timeout=retry_t,
                         )
@@ -2026,7 +2106,10 @@ async def _history_rows_for_player_audit(
                     # which occasionally destroys the JS execution context during DOM parsing.
                     # Retry once; this improves history coverage on large tournaments.
                     msg = str(ex)
-                    if "Execution context was destroyed" in msg or "most likely because of a navigation" in msg:
+                    if (
+                        not final_attempt_mode
+                        and ("Execution context was destroyed" in msg or "most likely because of a navigation" in msg)
+                    ):
                         await asyncio.sleep(0.35)
                         _log_step(f"History[{progress_label or match_side}]: retry nav ctx eid={eid}")
                         retry_nav_t = min(45.0, max(per_event_timeout_s * 1.5, per_event_timeout_s + 5.0))
@@ -2038,7 +2121,10 @@ async def _history_rows_for_player_audit(
                                     event_id=int(eid),
                                     periods=periods,
                                     nav_timeout_ms=_nav_timeout_ms(per_event_timeout_s + 5.0),
-                                    wait_stats_ms=wait_stats_ms,
+                                    wait_stats_ms=event_wait_stats_ms,
+                                    goto_retries=event_retry_goto,
+                                    open_tab_retries=event_retry_open,
+                                    period_retries=event_retry_period,
                                 ),
                                 timeout=retry_nav_t,
                             )
@@ -2244,6 +2330,9 @@ async def _history_rows_for_player_audit(
     failfast_trigger: Optional[str] = "history_source_unavailable" if source_unavailable_final else None
     consecutive_source_failures = 0
     budget_hit = False
+    dom_success_streak = 0
+    final_attempt_guard_active = False
+    final_attempt_guard_used = False
     if slow_mode:
         scan_cap_max = min(len(events), 24)
     else:
@@ -2274,9 +2363,11 @@ async def _history_rows_for_player_audit(
         return hist_pages[i % len(hist_pages)]
 
     async def _launch_next() -> bool:
-        nonlocal tasks
+        nonlocal tasks, final_attempt_guard_used
         # Limit total scanned events; this cap is independent from max_history.
         if (not no_limits_enabled) and (scanned + len(tasks)) >= scan_cap:
+            return False
+        if slow_mode and final_attempt_guard_active and final_attempt_guard_used:
             return False
         # Stop scheduling new work if we exceeded the budget.
         if enforce_side_budget and asyncio.get_running_loop().time() >= deadline:
@@ -2285,6 +2376,11 @@ async def _history_rows_for_player_audit(
             i, ev = next(ev_iter)
         except StopIteration:
             return False
+        if slow_mode and final_attempt_guard_active and not final_attempt_guard_used:
+            ev = dict(ev)
+            ev["_final_attempt_mode"] = True
+            final_attempt_guard_used = True
+            _log_step(f"History[{progress_label or match_side}]: final_attempt_guard enabled at scanned={scanned} valid={len(valid_rows)}")
         t = asyncio.create_task(one(i, ev, hist_page=_next_page(i)))
         tasks.add(t)
         return True
@@ -2350,6 +2446,7 @@ async def _history_rows_for_player_audit(
                 if bool(summary.get("_dom_wasted")):
                     wasted_dom_attempts += 1
             if reason is not None:
+                dom_success_streak = 0
                 if reason in (
                     "profile_links_empty",
                     "api_history_fetch_failed",
@@ -2360,6 +2457,7 @@ async def _history_rows_for_player_audit(
                 else:
                     consecutive_source_failures = 0
                 if reason == "dom_stats_error":
+                    dom_success_streak = 0
                     derr = str((summary or {}).get("dom_error") or "") if isinstance(summary, dict) else ""
                     code = _extract_dom_code(derr)
                     if code:
@@ -2372,6 +2470,7 @@ async def _history_rows_for_player_audit(
                         and wait_stats_ms < wait_stats_fallback_ms
                         and len(valid_rows) == 0
                         and scanned <= 3
+                        and not final_attempt_guard_active
                         and code in ("rows_not_ready", "period_select_failed")
                     ):
                         prev_wait = wait_stats_ms
@@ -2450,6 +2549,7 @@ async def _history_rows_for_player_audit(
                         }
                     )
             elif row is None:
+                dom_success_streak = 0
                 consecutive_source_failures = 0
                 consecutive_dom_timeouts = 0
                 consecutive_step_failures = 0
@@ -2459,6 +2559,7 @@ async def _history_rows_for_player_audit(
                 last_ui_unavailable_code = None
                 excluded_by_reason["unknown_drop"] = excluded_by_reason.get("unknown_drop", 0) + 1
             else:
+                dom_success_streak += 1
                 consecutive_source_failures = 0
                 consecutive_dom_timeouts = 0
                 consecutive_step_failures = 0
@@ -2467,6 +2568,17 @@ async def _history_rows_for_player_audit(
                 rows_not_ready_hits_consecutive = 0
                 last_ui_unavailable_code = None
                 valid_rows.append((idx, row))
+                if _should_restore_wait_stats(
+                    wait_stats_ms=wait_stats_ms,
+                    wait_stats_base_ms=wait_stats_base_ms,
+                    success_streak=dom_success_streak,
+                ):
+                    prev_wait = int(wait_stats_ms or 0)
+                    wait_stats_ms = int(wait_stats_base_ms)
+                    dom_success_streak = 0
+                    _log_step(
+                        f"History[{progress_label or match_side}]: wait_stats_restore old={prev_wait} new={wait_stats_ms}"
+                    )
                 if progress_cb is not None:
                     try:
                         await progress_cb(
@@ -2552,6 +2664,16 @@ async def _history_rows_for_player_audit(
 
             # Launch next task only after fail-fast checks above.
             if len(valid_rows) < max_history:
+                if not final_attempt_guard_active:
+                    remaining_side_s = max(0.0, side_deadline - asyncio.get_running_loop().time())
+                    final_attempt_guard_active = _should_enable_final_attempt_guard(
+                        slow_mode=slow_mode,
+                        no_limits_enabled=no_limits_enabled,
+                        have_valid=len(valid_rows),
+                        max_history=max_history,
+                        remaining_side_s=remaining_side_s,
+                        per_event_timeout_s=per_event_timeout_s,
+                    )
                 await _launch_next()
         if len(valid_rows) >= max_history:
             # Cancel any remaining tasks; we have enough.
